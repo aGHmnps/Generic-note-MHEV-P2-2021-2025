@@ -1,0 +1,888 @@
+import logging
+import numpy as np
+import pandas as pd
+from typing import List, Dict, Tuple
+from datetime import datetime
+from pyspark.sql import Window, SparkSession
+from pyspark.sql import functions as F
+from pyspark.sql.types import *
+from pyspark.sql.functions import pandas_udf, PandasUDFType
+from pyspark import StorageLevel
+import time
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+def create_bin_mappers(bins_regime, bins_couple):
+    """Factory function to create Spark UDFs that map bin indices back to values."""
+    
+    # Ensure bins are arrays
+    bins_regime_arr = np.array(bins_regime)
+    bins_couple_arr = np.array(bins_couple)
+    regime_len = len(bins_regime_arr)
+    couple_len = len(bins_couple_arr)
+
+    @F.udf(DoubleType())
+    def get_regime_min(idx):
+        idx = int(idx)
+        if 0 <= idx < regime_len - 1:
+            return float(bins_regime_arr[idx])
+        return None
+    
+    @F.udf(DoubleType())
+    def get_regime_max(idx):
+        idx = int(idx)
+        if 0 <= idx < regime_len - 1:
+            return float(bins_regime_arr[idx + 1])
+        return None
+        
+    @F.udf(DoubleType())
+    def get_couple_mel_min(idx):
+        idx = int(idx)
+        if 0 <= idx < couple_len - 1:
+            return float(bins_couple_arr[idx])
+        return None
+        
+    @F.udf(DoubleType())
+    def get_couple_mel_max(idx):
+        idx = int(idx)
+        if 0 <= idx < couple_len - 1:
+            return float(bins_couple_arr[idx + 1])
+        return None
+
+    return get_regime_min, get_regime_max, get_couple_mel_min, get_couple_mel_max
+
+class OptimizedDataLoader:
+    """Optimized data loading with partition pruning"""
+    
+    def __init__(self, spark_session, config):
+        self.spark = spark_session
+        self.config = config
+        self.logger = logging.getLogger(__name__)
+    
+    def load_timeseries_data(self, loan_ids: List[str], tcid_runids: List[str]):
+        """Load timeseries data with optimized filtering"""
+        try:
+            self.logger.info(f"Loading data for {len(loan_ids)} loans and {len(tcid_runids)} trips")
+            
+            df = self.spark.table(self.config['table_name'])
+            
+            if len(loan_ids) < 1000:
+                df = df.filter(F.col("Loan_Conducteur_ID").isin(loan_ids))
+            else:
+                loan_df = self.spark.createDataFrame([(lid,) for lid in loan_ids], ["loan_id"])
+                df = df.join(F.broadcast(loan_df), df.Loan_Conducteur_ID == loan_df.loan_id).drop("loan_id")
+                
+            df = df.filter(F.col("tcid_runid").isin(tcid_runids))
+            
+            signal_map = self.config['signal_mapping']
+            df = df.filter(
+                (F.col(signal_map['timestamp']).isNotNull()) & 
+                (F.col(signal_map['vitesse']).isNotNull()) &
+                (F.col(signal_map['regime_mth']).isNotNull()) &
+                (F.col(signal_map['couple_mel']).isNotNull()) &
+                (F.col(signal_map['regime_mel']).isNotNull())
+            ).select(
+                F.col("tcid_runid").alias("trip_id"),
+                F.col("Loan_Conducteur_ID").alias("loan_id"),
+                F.col(signal_map['timestamp']).cast("double").alias("dt"),
+                F.col(signal_map['vitesse']).cast("double").alias("vitesse"),
+                F.col(signal_map['regime_mth']).cast("double").alias("regime_mth"),
+                F.col(signal_map['couple_mel']).cast("double").alias("couple_mel"),
+                F.col(signal_map['regime_mel']).cast("double").alias("regime_mel")
+            )
+            
+            self.logger.info(f"✓ Data loaded successfully")
+            return df
+            
+        except Exception as e:
+            self.logger.error(f"Error loading data: {str(e)}")
+            raise
+
+class SinglePassTransformer:
+    def __init__(self, config):
+        self.config = config
+        self.thresholds = config['thresholds']
+        self.logger = logging.getLogger(__name__)
+    
+    def transform_for_branch(self, df, branch_name: str):
+        """Apply all transformations in a single pass for specified branch"""
+        self.logger.info(f"Single-pass transformation for branch: {branch_name}")
+        
+        # Get regime signal to use for this branch
+        branch_config = self.config['branches'][branch_name]
+        regime_signal = branch_config.get('regime_signal', 'regime_mth')
+        
+        # Define event conditions for each branch
+        if branch_name == 'vehicule_arrete':
+            event_condition = (F.col("vitesse") <= self.thresholds['vehicle_moving_threshold'])
+        elif branch_name == 'roulant_mth_off':
+            event_condition = (
+                (F.col("vitesse") > self.thresholds['vehicle_moving_threshold']) &
+                (F.col("regime_mth") <= self.thresholds['engine_on_threshold'])
+            )
+        elif branch_name == 'roulant_mth_demarre':
+            event_condition = (
+                (F.col("vitesse") > self.thresholds['vehicle_moving_threshold']) &
+                (F.col("regime_mth") > self.thresholds['engine_on_threshold'])
+            )
+        elif branch_name == 'mode_boost':
+            event_condition = (
+                (F.col("regime_mth") > self.thresholds['engine_on_threshold']) &
+                (F.col("couple_mel") > 0)
+            )
+        elif branch_name == 'mode_recharge_batterie':
+            event_condition = (
+                (F.col("regime_mth") > self.thresholds['engine_on_threshold']) &
+                (F.col("couple_mel") < 0)
+            )
+        elif branch_name == 'mode_freinage_regeneratif':
+            event_condition = (
+                (F.col("regime_mth") <= self.thresholds['engine_on_threshold']) &
+                (F.col("couple_mel") < 0)
+            )
+        elif branch_name == 'mode_zev':
+            event_condition = (
+                (F.col("regime_mth") <= self.thresholds['engine_on_threshold']) &
+                (F.col("couple_mel") > 0)
+            )
+        else:
+            raise ValueError(f"Unknown branch: {branch_name}")
+        
+        window_spec = Window.partitionBy("trip_id").orderBy("dt")
+        
+        # Apply signal corrections and add event_signal
+        df_with_events = df.select(
+            "trip_id", "loan_id", "dt",
+            F.when(F.col("regime_mth") < self.thresholds['engine_rpm_min'], 
+                   self.thresholds['engine_rpm_min'])
+              .when(F.col("regime_mth") > self.thresholds['engine_rpm_max'], 
+                   self.thresholds['engine_rpm_max'])
+              .otherwise(F.col("regime_mth")).alias("regime_mth"),
+            
+            F.when(F.col("vitesse") < self.thresholds['vehicle_speed_min'], 
+                   self.thresholds['vehicle_speed_min'])
+              .when(F.col("vitesse") > self.thresholds['vehicle_speed_max'], 
+                   self.thresholds['vehicle_speed_max'])
+              .otherwise(F.col("vitesse")).alias("vitesse"),
+            
+            # Add regime_mel correction
+            F.when(F.col("regime_mel") < self.thresholds['mel_rpm_min'], 
+                   self.thresholds['mel_rpm_min'])
+              .when(F.col("regime_mel") > self.thresholds.get('mel_rpm_max', 10000), 
+                   self.thresholds.get('mel_rpm_max', 10000))
+              .otherwise(F.col("regime_mel")).alias("regime_mel"),
+            
+            F.col("couple_mel")
+        ).withColumn(
+            "event_signal",
+            F.when(event_condition, 1).otherwise(0)
+        )
+        
+        #Calculate segment_id BEFORE filtering
+        df_with_segments = df_with_events.withColumn(
+            "segment_id",
+            F.sum(
+                F.when(
+                    (F.lag("event_signal", 1, 0).over(window_spec) == 0) & 
+                    (F.col("event_signal") == 1),
+                    1
+                ).otherwise(0)
+            ).over(window_spec)
+        )
+        
+        # NOW filter to keep only event_signal == 1
+        df_filtered = df_with_segments.filter(F.col("event_signal") == 1)
+        
+        # STEP 4: Validate segments (keep only segments with >1 point)
+        window_segment = Window.partitionBy("trip_id", "segment_id")
+        df_valid = df_filtered.withColumn(
+            "segment_points", F.count("*").over(window_segment)
+        ).filter(
+            F.col("segment_points") > 1
+        ).drop("segment_points", "event_signal")
+        
+        self.logger.info(f"✓ Single-pass transformation complete for {branch_name}")
+        return df_valid
+
+class VectorizedH2DCalculator:
+    """Calculate H2D using Pandas UDF with vectorized operations and trip-level aggregation."""
+    
+    def __init__(self, config):
+        self.config = config
+        self.logger = logging.getLogger(__name__)
+    
+    def get_bins_for_branch(self, branch_name: str):
+        """Get appropriate bins for the specified branch"""
+        if branch_name in self.config.get('branch_specific_bins', {}):
+            bins = self.config['branch_specific_bins'][branch_name]
+            self.logger.info(f"Using branch-specific bins for {branch_name}")
+        else:
+            bins = self.config['h2d_bins']
+            self.logger.info(f"Using default bins for {branch_name}")
+        
+        # Determine which regime signal to use
+        regime_key = 'regime_mel' if 'regime_mel' in bins else 'regime_mth'
+        
+        return {
+            'couple_mel': np.array(bins['couple_mel']),
+            'regime': np.array(bins[regime_key]),
+            'regime_signal': regime_key  # Track which signal we're using
+        }
+        
+    def calculate_h2d_vectorized(self, df, branch_name: str):
+        """
+        Calculate H2D for all segments using vectorized Pandas UDF,
+        followed by trip-level aggregation.
+        """
+        self.logger.info(f"Calculating H2D matrices for branch: {branch_name}")
+        
+        # Get branch-specific bins
+        bins_config = self.get_bins_for_branch(branch_name)
+        bins_regime = bins_config['regime']
+        bins_couple = bins_config['couple_mel']
+        regime_signal = bins_config['regime_signal']
+        
+        self.logger.info(f"  Couple MEL bins: {len(bins_couple)-1} bins from {bins_couple[0]} to {bins_couple[-1]}")
+        self.logger.info(f"  {regime_signal.upper()} bins: {len(bins_regime)-1} bins from {bins_regime[0]} to {bins_regime[-1]}")
+        
+        # Schema for the output of the PANDAS UDF (segment-level sparse data using indices)
+        h2d_segment_sparse_schema = StructType([
+            StructField("trip_id", StringType(), False),
+            StructField("loan_id", StringType(), False),
+            # Note: segment_id is not emitted, as the UDF result is immediately aggregated later.
+            StructField("regime_bin_idx", IntegerType(), False),
+            StructField("couple_bin_idx", IntegerType(), False),
+            StructField("duration_seconds", DoubleType(), False)
+        ])
+        
+        @pandas_udf(h2d_segment_sparse_schema, PandasUDFType.GROUPED_MAP)
+        def calculate_h2d_udf(pdf: pd.DataFrame) -> pd.DataFrame:
+            """
+            Calculate H2D for a single segment using vectorized binning (np.diff, np.digitize).
+            This is significantly faster than nested Python loops.
+            """
+            pdf = pdf.sort_values('dt').reset_index(drop=True)
+            
+            trip_id = pdf['trip_id'].iloc[0]
+            loan_id = pdf['loan_id'].iloc[0]
+
+            def get_empty_df_from_schema() -> pd.DataFrame:
+                """Helper function to create an empty DataFrame with correct column types."""
+                return pd.DataFrame({
+                    'regime_bin_idx': pd.Series(dtype='int32'),
+                    'couple_bin_idx': pd.Series(dtype='int32'),
+                    'duration_seconds': pd.Series(dtype='float64'),
+                    'trip_id': pd.Series(dtype='object'),
+                    'loan_id': pd.Series(dtype='object')
+                })
+            # -------------------------
+            
+            if len(pdf) < 2:
+                # Return empty DataFrame with correct column types
+                return get_empty_df_from_schema()
+                
+            times = pdf['dt'].values
+            regimes = pdf[regime_signal].values
+            couples = pdf['couple_mel'].values
+            
+            # Calcul des durées
+            time_deltas = np.diff(times)
+            regime_vals = regimes[:-1]
+            couple_vals = couples[:-1]
+            
+            
+            # Filtrer les valeurs hors bornes
+            n_regime_bins = len(bins_regime) - 1
+            n_couple_bins = len(bins_couple) - 1
+
+            regime_idx_list = []
+            couple_idx_list = []
+            duration_list = []
+
+            for i in range(n_regime_bins):
+                for j in range(n_couple_bins):
+                    # ✅ CONDITION GLYPHWORKS: (signal > lower) & (signal <= upper)
+                    mask = (
+                        (regime_vals > bins_regime[i]) & (regime_vals <= bins_regime[i+1]) &
+                        (couple_vals > bins_couple[j]) & (couple_vals <= bins_couple[j+1])
+                    )
+                    
+                    if np.any(mask):
+                        total_duration = time_deltas[mask].sum()
+                        if total_duration > 0:
+                            regime_idx_list.append(i)
+                            couple_idx_list.append(j)
+                            duration_list.append(total_duration)
+            
+            if len(regime_idx_list) == 0:
+                return get_empty_df_from_schema()
+            
+            # Créer le DataFrame de sortie
+            sparse_df = pd.DataFrame({
+                'regime_bin_idx': regime_idx_list,
+                'couple_bin_idx': couple_idx_list,
+                'duration_seconds': duration_list,
+                'trip_id': trip_id,
+                'loan_id': loan_id
+            })
+            
+            return sparse_df.astype({
+                'regime_bin_idx': 'int32',
+                'couple_bin_idx': 'int32',
+                'duration_seconds': 'float64',
+                'trip_id': 'object',
+                'loan_id': 'object'
+            })
+
+        # Apply UDF to get segment-level sparse results
+        h2d_segment_sparse = df.groupBy("trip_id", "loan_id", "segment_id").apply(calculate_h2d_udf)
+
+        # ----------------------------------------------------------------------
+        # OPTIMIZATION STEP: Aggregate results by Trip/Bin (Removes segment_id)
+        # ----------------------------------------------------------------------
+        self.logger.info("Aggregating segment results to trip level...")
+        
+        # 1. Aggregate duration per Trip/Loan/Bin
+        h2d_trip_sparse = h2d_segment_sparse.groupBy(
+            "trip_id", "loan_id", "regime_bin_idx", "couple_bin_idx"
+        ).agg(
+            F.sum("duration_seconds").alias("duration_seconds")
+        )
+        
+        # 2. Map bin indices back to min/max values using the helper UDFs
+        
+        # IMPORTANT: create_bin_mappers must be defined in the global scope 
+        # where Spark can resolve it.
+        regime_min_udf, regime_max_udf, couple_min_udf, couple_max_udf = \
+            create_bin_mappers(bins_regime, bins_couple)
+        
+        # Apply mapping UDFs
+        h2d_results = h2d_trip_sparse.withColumn(
+            "regime_min", regime_min_udf(F.col("regime_bin_idx"))
+        ).withColumn(
+            "regime_max", regime_max_udf(F.col("regime_bin_idx"))
+        ).withColumn(
+            "couple_mel_min", couple_min_udf(F.col("couple_bin_idx"))
+        ).withColumn(
+            "couple_mel_max", couple_max_udf(F.col("couple_bin_idx"))
+        ).select(
+            "trip_id", "loan_id", "regime_min", "regime_max", 
+            "couple_mel_min", "couple_mel_max", "duration_seconds"
+        ).filter(F.col("duration_seconds") > 0)
+
+        # Add metadata
+        h2d_results = h2d_results.withColumn(
+            "branch", F.lit(branch_name)
+        ).withColumn(
+            "branch_name", F.lit(self.config['branches'][branch_name]['name'])
+        ).withColumn(
+            "regime_signal", F.lit(regime_signal)
+        ).withColumn(
+            "processing_timestamp", F.current_timestamp()
+        )
+        
+        self.logger.info(f"✓ H2D calculation and trip-level aggregation complete for {branch_name}")
+        return h2d_results 
+
+class OptimizedBranchProcessor:
+    """Orchestrates optimized pipeline for all branches"""
+    
+    def __init__(self, config, data_loader, transformer, h2d_calculator):
+        self.config = config
+        self.data_loader = data_loader
+        self.transformer = transformer
+        self.h2d_calculator = h2d_calculator
+        self.logger = logging.getLogger(__name__)
+    
+    def process_single_branch(self, raw_df, branch_name: str):
+        """Process a single branch with optimized pipeline"""
+        branch_config = self.config['branches'][branch_name]
+        
+        print(f"\n{'='*80}")
+        print(f"Processing Branch: {branch_name}")
+        print(f"Description: {branch_config['description']}")
+        print(f"{'='*80}")
+        
+        try:
+            df_segments = self.transformer.transform_for_branch(raw_df, branch_name)
+            
+            if df_segments.isEmpty():
+                print(f"⚠ No segments found for branch {branch_name}, skipping...")
+                return None
+            
+            h2d_results = self.h2d_calculator.calculate_h2d_vectorized(df_segments, branch_name)
+            
+            print(f"✓ Branch {branch_name} completed successfully")
+            return h2d_results
+            
+        except Exception as e:
+            self.logger.error(f"✗ Error processing branch {branch_name}: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    def process_all_branches(self, raw_df, branch_list=None):
+        """Process all three branches"""
+        all_results = []
+        
+        if branch_list is None:
+            
+            branches_to_process = list(self.config['branches'].keys())
+            self.logger.info(f"Processing ALL branches: {branches_to_process}")
+        else:
+            branches_to_process = branch_list
+            self.logger.info(f"Processing SELECTED branches: {branches_to_process}")
+        
+        # Validate branch names
+        invalid_branches = [b for b in branches_to_process if b not in self.config['branches']]
+        if invalid_branches:
+            raise ValueError(f"Invalid branch names: {invalid_branches}. "
+                             f"Valid branches: {list(self.config['branches'].keys())}")
+        for branch_name in branches_to_process:
+            result = self.process_single_branch(raw_df, branch_name)
+            if result is not None:
+                all_results.append(result)
+        
+        if all_results:
+            print(f"\n{'='*80}")
+            print("Combining all branch results...")
+            print(f"{'='*80}")
+            
+            combined_df = all_results[0]
+            for result_df in all_results[1:]:
+                combined_df = combined_df.union(result_df)
+            
+            print(f"✓ All branches combined successfully")
+            return combined_df
+        else:
+            print("⚠ No results from any branch")
+            return None
+
+def display_h2d_heatmap_gW(loan_id, trip_id, branch_name,results, use_bin_centers=True,CONFIG = CONFIG_dict ):
+    """
+    Display H2D matrix as a heatmap matching GlyphWorks format
+    
+    Parameters:
+    -----------
+    use_bin_centers : bool, default=True
+        If True, display bin centers (like GlyphWorks)
+        If False, display bin edges (lower bounds)
+    """
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    
+    trip_data = results.filter(
+        (F.col("loan_id") == loan_id) &
+        (F.col("trip_id") == trip_id) &
+        (F.col("branch_name") == branch_name)
+    ).toPandas()
+    
+    if trip_data.empty:
+        print(f"⚠ No data found for {trip_id} - {branch_name}")
+        return
+    
+    # Get branch-specific bins
+    branch_key = None
+    for key, config in CONFIG['branches'].items():
+        if config['name'] == branch_name:
+            branch_key = key
+            break
+    
+    if branch_key is None:
+        print(f"⚠ Branch name '{branch_name}' not found in CONFIG")
+        return
+    
+    if branch_key in CONFIG.get('branch_specific_bins', {}):
+        bins_config = CONFIG['branch_specific_bins'][branch_key]
+        print(f"✓ Using branch-specific bins for {branch_key}")
+    else:
+        bins_config = CONFIG['h2d_bins']
+        print(f"✓ Using default bins for {branch_key}")
+    
+    regime_signal_used = trip_data['regime_signal'].iloc[0]
+    
+    # Use the appropriate bins based on the signal used in calculation
+    bins_regime = np.array(bins_config.get(regime_signal_used, bins_config['regime_mel']))
+    bins_couple = np.array(bins_config['couple_mel'])
+    
+    print(f"  Regime Mth/MEL ({regime_signal_used.split('_')[1].upper()}) bins: {len(bins_regime)-1} bins from {bins_regime[0]} to {bins_regime[-1]}")
+    print(f"  Couple MEL bins: {len(bins_couple)-1} bins from {bins_couple[0]} to {bins_couple[-1]}")
+    
+    if len(bins_regime) > 1:
+        print(f"  Regime step size: {bins_regime[1] - bins_regime[0]}")
+    if len(bins_couple) > 1:
+        print(f"  Couple step size: {bins_couple[1] - bins_couple[0]}")
+    
+    n_regime = len(bins_regime) - 1
+    n_couple = len(bins_couple) - 1
+    
+    # Create matrix: ROWS = Couple, COLUMNS = Regime (to match GlyphWorks)
+    h2d_matrix = np.zeros((n_couple, n_regime))
+    
+    # Fill matrix
+    for _, row in trip_data.iterrows():
+        regime_min = row['regime_min']  # ✅ Bord inférieur du bin
+        couple_min = row['couple_mel_min']  # ✅ Bord inférieur du bin
+        
+        # ✅ Ces valeurs correspondent directement aux bins[:-1]
+        regime_idx = np.where(bins_regime[:-1] == regime_min)[0]
+        couple_idx = np.where(bins_couple[:-1] == couple_min)[0]
+        
+        if len(regime_idx) > 0 and len(couple_idx) > 0:
+            h2d_matrix[couple_idx[0], regime_idx[0]] += row['duration_seconds']
+    
+    # Create axis labels
+    if use_bin_centers:
+        # GlyphWorks style: show bin centers
+        regime_labels = [(bins_regime[i] + bins_regime[i+1]) / 2 for i in range(n_regime)]
+        couple_labels = [(bins_couple[i] + bins_couple[i+1]) / 2 for i in range(n_couple)]
+        label_type = "Bin Center"
+    else:
+        # Edge style: show lower bounds
+        regime_labels = bins_regime[:-1]
+        couple_labels = bins_couple[:-1]
+        label_type = "Lower Bin Edge"
+    
+    # Create DataFrame: ROWS = Couple (high to low), COLUMNS = Regime (low to high)
+    h2d_df = pd.DataFrame(
+        h2d_matrix[::-1, :],  # Reverse couple axis for display (high to low)
+        index=couple_labels[::-1],  # Couple on Y-axis (reversed)
+        columns=regime_labels  # Regime on X-axis
+    )
+    
+    max_value = np.nanmax(h2d_matrix)
+    
+    if max_value > 0:
+        # Find position in original matrix (before reversing)
+        max_idx = np.unravel_index(np.nanargmax(h2d_matrix), h2d_matrix.shape)
+        max_couple_idx = max_idx[0]
+        max_regime_idx = max_idx[1]
+        
+        # Get actual values (not reversed yet)
+        max_couple = couple_labels[max_couple_idx]
+        max_regime = regime_labels[max_regime_idx]
+        
+        print(f"\n  ✓ Maximum value: {max_value:.2f} seconds")
+        print(f"    Located at: Regime={max_regime:.1f} tr/min, Couple={max_couple:.1f} N.m")
+        
+        max_couple_plot = max_couple
+        max_regime_plot = max_regime
+    else:
+        max_couple_plot = None
+        max_regime_plot = None
+        
+    # Create heatmap
+    fig, ax = plt.subplots(figsize=(20, 12))
+    
+    h2d_plot = h2d_df.replace(0, np.nan)
+    
+    regime_tick_freq = max(1, n_regime // 30)
+    couple_tick_freq = max(1, n_couple // 30)
+    
+    sns.heatmap(
+        h2d_plot,
+        cmap='YlOrRd',
+        cbar_kws={'label': 'Duration (seconds)', 'format': '%.2f'},
+        linewidths=0,
+        square=False,
+        xticklabels=regime_tick_freq,
+        yticklabels=couple_tick_freq,
+        robust=True,
+        ax=ax
+    )
+    
+    # Annotate max value
+    if max_value > 0 and max_couple_plot is not None:
+        max_row_idx = h2d_df.index.get_loc(max_couple_plot)
+        max_col_idx = h2d_df.columns.get_loc(max_regime_plot)
+        
+        ax.text(
+            max_col_idx + 0.5,
+            max_row_idx + 0.5,
+            f'{max_value:.2f}s',
+            ha='center',
+            va='center',
+            fontsize=14,
+            fontweight='bold',
+            color='white',
+            bbox=dict(
+                boxstyle='round,pad=0.6',
+                facecolor='black',
+                edgecolor='white',
+                linewidth=2.5,
+                alpha=0.9
+            )
+        )
+    
+    max_text = f"\nMax: {max_value:.2f}s at (Regime={max_regime:.1f}, Couple={max_couple:.1f})" if max_value > 0 else ""
+    
+    plt.title(f'H2D Matrix: {trip_id} - {branch_name}\n'
+              f'Regime: [{bins_regime[0]:.1f}, {bins_regime[-1]:.1f}] tr/min | '
+              f'Couple: [{bins_couple[0]:.1f}, {bins_couple[-1]:.1f}] N.m'
+              f'{max_text}',
+              fontsize=16, fontweight='bold')
+    plt.xlabel(f'Regime Mth/MEL ({regime_signal_used.split("_")[1].upper()}) (tr/min) - {label_type}', fontsize=14, fontweight='bold')
+    plt.ylabel(f'Couple MEL (N.m) - {label_type}', fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    
+    display(plt.gcf())
+    plt.close()
+    
+    # Statistics
+    print(f"\nH2D Matrix Statistics:")
+    print(f"  Total duration: {h2d_df.sum().sum():.2f} seconds")
+    print(f"  Non-zero bins: {(h2d_df > 0).sum().sum()}")
+    print(f"  Max duration in single bin: {max_value:.2f} seconds")
+    print(f"  Matrix shape: {h2d_df.shape} (rows=couple, cols=regime)")
+    
+    h2d_df.index.name = 'Couple_MEL (N.m)'
+    h2d_df.columns.name = f'Regime_Mth/MEL ({regime_signal_used.split("_")[1].upper()}) (tr/min)'
+    
+    #print(f"\nSample of H2D Matrix (first 10 rows, first 10 columns):")
+    #display(h2d_df.iloc[:10, :10].round(2))
+    
+    return h2d_df
+
+def process_batch_optimized(loan_tcid_list, batch_size=100,branch_list=None):
+    """Process loan_id and tcid_runid combinations in batches (OPTIMIZED)"""
+    all_batch_results = []
+    
+    for i in range(0, len(loan_tcid_list), batch_size):
+        batch = loan_tcid_list[i:i+batch_size]
+        batch_num = i // batch_size + 1
+        total_batches = (len(loan_tcid_list) + batch_size - 1) // batch_size
+        
+        print(f"\n{'='*80}")
+        print(f"PROCESSING BATCH {batch_num}/{total_batches}")
+        print(f"Items: {i+1} to {min(i+batch_size, len(loan_tcid_list))}")
+        print(f"{'='*80}")
+        
+        loan_ids = list(set([item[0] for item in batch]))
+        tcid_runids = [item[1] for item in batch]
+        
+        print(f"Unique Loan IDs: {len(loan_ids)}")
+        print(f"TCID Run IDs: {len(tcid_runids)}")
+        
+        if branch_list:
+            print(f"Branches to process: {', '.join(branch_list)}")
+            
+        try:
+            print("\n[1/2] Loading raw data...")
+            raw_df = data_loader.load_timeseries_data(loan_ids, tcid_runids)
+            
+            if raw_df.isEmpty():
+                print("⚠ No data found for this batch, skipping...")
+                continue
+            
+            print("\n[2/2] Processing all branches with optimized pipeline...")
+            batch_results = branch_processor.process_all_branches(raw_df,branch_list)
+            
+            if batch_results is not None:
+                all_batch_results.append(batch_results)
+                print(f"\n✓ Batch {batch_num} completed successfully")
+            else:
+                print(f"\n⚠ No results for batch {batch_num}")
+        
+        except Exception as e:
+            print(f"\n✗ Error processing batch {batch_num}: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            continue
+
+    if all_batch_results:
+        print(f"\n{'='*80}")
+        print("COMBINING ALL BATCH RESULTS")
+        print(f"{'='*80}")
+        
+        final_results = all_batch_results[0]
+        for result_df in all_batch_results[1:]:
+            final_results = final_results.union(result_df)
+        
+        print(f"✓ All batches combined successfully")
+        return final_results
+    else:
+        print("\n⚠ No results to combine")
+        return None
+
+data_loader = OptimizedDataLoader(spark, CONFIG_dict)
+transformer = SinglePassTransformer(CONFIG_dict)
+h2d_calculator = VectorizedH2DCalculator(CONFIG_dict)
+branch_processor = OptimizedBranchProcessor(CONFIG_dict, data_loader, transformer, h2d_calculator)
+
+print("✓ All optimized components initialized")
+
+import logging
+import numpy as np
+import pandas as pd
+from pyspark.sql import functions as F
+from pyspark.sql.types import *
+from pyspark.sql.functions import pandas_udf, PandasUDFType
+
+class MELRevolutionsCalculator:
+    """Calculate total number of revolutions for Electric Motor (MEL) per trip"""
+    
+    def __init__(self, config):
+        self.config = config
+        self.logger = logging.getLogger(__name__)
+    
+    def calculate_total_revolutions(self, df):
+        """
+        Calculate total number of MEL revolutions per trip using trapezoidal integration.
+        
+        Formula:
+        - regime_mel is in RPM (revolutions per minute)
+        - Convert to tr/s: regime_mel / 60
+        - Integrate over time: nbr_tours_MEL = ∫(regime_mel/60) * dt
+        
+        Parameters:
+        -----------
+        df : Spark DataFrame
+            Must contain columns: trip_id, loan_id, dt, regime_mel
+        
+        Returns:
+        --------
+        Spark DataFrame with columns: loan_id, trip_id, nbr_tours_MEL
+        """
+        self.logger.info(f"Calculating total MEL revolutions per trip...")
+        
+        # Schema for output
+        revolutions_schema = StructType([
+            StructField("loan_id", StringType(), False),
+            StructField("trip_id", StringType(), False),
+            StructField("nbr_tours_MEL", DoubleType(), False)
+        ])
+        
+        @pandas_udf(revolutions_schema, PandasUDFType.GROUPED_MAP)
+        def calculate_revolutions_udf(pdf: pd.DataFrame) -> pd.DataFrame:
+            """
+            Calculate total MEL revolutions for a single trip using trapezoidal integration.
+            
+            nbr_tours_MEL = ∫(regime_mel/60) dt
+            """
+            # Sort by time
+            pdf = pdf.sort_values('dt').reset_index(drop=True)
+            
+            loan_id = pdf['loan_id'].iloc[0]
+            trip_id = pdf['trip_id'].iloc[0]
+            
+            if len(pdf) < 2:
+                # Not enough points for integration
+                return pd.DataFrame({
+                    'loan_id': [loan_id],
+                    'trip_id': [trip_id],
+                    'nbr_tours_MEL': [0.0]
+                })
+            
+            # Extract time and regime_mel
+            times = pdf['dt'].values
+            regime_mel_rpm = pdf['regime_mel'].values
+            
+            # Convert RPM to revolutions per second (tr/s)
+            regime_mel_trs = regime_mel_rpm / 60.0
+            
+            # Trapezoidal integration: ∫(regime_mel_trs) dt
+            nbr_tours_MEL = np.trapz(regime_mel_trs, times)
+            
+            # Create result
+            result_df = pd.DataFrame({
+                'loan_id': [str(loan_id)],
+                'trip_id': [str(trip_id)],
+                'nbr_tours_MEL': [float(nbr_tours_MEL)]
+            })
+            
+            return result_df
+        
+        # Apply UDF grouped by loan_id and trip_id
+        revolutions_trip = df.groupBy("loan_id", "trip_id").apply(calculate_revolutions_udf)
+        
+        self.logger.info(f"✓ Total MEL revolutions calculation complete")
+        return revolutions_trip
+
+
+# ============================================================================
+# MAIN FUNCTION: Calculate MEL Revolutions for List of Trips
+# ============================================================================
+
+def calculate_mel_revolutions(loan_tcid_list, batch_size=100):
+    """
+    Calculate total MEL revolutions per trip.
+    
+    Parameters:
+    -----------
+    loan_tcid_list : list of tuples
+        [(loan_id, trip_id), ...]
+    batch_size : int
+        Batch size for processing
+    
+    Returns:
+    --------
+    Spark DataFrame with columns: loan_id, trip_id, nbr_tours_MEL
+    """
+    print(f"\n{'='*80}")
+    print(f"CALCULATING TOTAL MEL REVOLUTIONS PER TRIP")
+    print(f"{'='*80}\n")
+    
+    all_batch_results = []
+    
+    for i in range(0, len(loan_tcid_list), batch_size):
+        batch = loan_tcid_list[i:i+batch_size]
+        batch_num = i // batch_size + 1
+        total_batches = (len(loan_tcid_list) + batch_size - 1) // batch_size
+        
+        print(f"Processing Batch {batch_num}/{total_batches}...")
+        
+        loan_ids = list(set([item[0] for item in batch]))
+        tcid_runids = [item[1] for item in batch]
+        
+        try:
+            # Load raw data using existing data_loader
+            print(f"  [1/2] Loading data for {len(loan_ids)} loans, {len(tcid_runids)} trips...")
+            raw_df = data_loader.load_timeseries_data(loan_ids, tcid_runids)
+            
+            if raw_df.isEmpty():
+                print("  ⚠ No data found for this batch")
+                continue
+            
+            # Calculate revolutions
+            print("  [2/2] Calculating MEL revolutions...")
+            mel_calc = MELRevolutionsCalculator(CONFIG_dict)
+            batch_results = mel_calc.calculate_total_revolutions(raw_df)
+            
+            all_batch_results.append(batch_results)
+            print(f"  ✓ Batch {batch_num} completed")
+            
+        except Exception as e:
+            print(f"  ✗ Error in batch {batch_num}: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            continue
+    
+    # Combine all batches
+    if all_batch_results:
+        print(f"\n{'='*80}")
+        print("COMBINING RESULTS...")
+        print(f"{'='*80}\n")
+        
+        final_results = all_batch_results[0]
+        for result_df in all_batch_results[1:]:
+            final_results = final_results.union(result_df)
+        
+        print("✓ All batches combined successfully")
+        
+        # Show summary statistics
+        print("\n" + "="*80)
+        print("SUMMARY STATISTICS")
+        print("="*80)
+        final_results.select(
+            F.count("*").alias("num_trips"),
+            F.sum("nbr_tours_MEL").alias("total_revolutions"),
+            F.avg("nbr_tours_MEL").alias("avg_revolutions_per_trip"),
+            F.max("nbr_tours_MEL").alias("max_revolutions"),
+            F.min("nbr_tours_MEL").alias("min_revolutions")
+        ).show()
+        
+        return final_results
+    else:
+        print("\n⚠ No results to combine")
+        return None
+
