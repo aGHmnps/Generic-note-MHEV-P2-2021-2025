@@ -1,0 +1,120 @@
+#only used distance and duration 
+def duree_distance_GW(pdf):
+    """
+    Calculate trip duration and distance using GlyphWorks method.
+    Designed for PySpark applyInPandas().
+    
+    Expected input columns:
+    - TIME (timestamp in seconds)
+    - VEHICLE_SPEED (speed in km/h or m/s)
+    - VIN (vehicle identifier)
+    - TRIP_ID (trip identifier)
+    
+    Returns DataFrame with schema matching myfunc_dev_schema.
+    """
+    import numpy as np
+    import pandas as pd
+    
+    # Configuration 
+    INPUT_SPEED_UNIT = 'kmh'  
+    SPEED_LIMIT_KMH = 250.0
+    MIN_SPEED_KMH = 0.0
+    
+    # mapping
+    time_col = 'TIMESTAMP_double'
+    speed_col = 'VEHICLE_SPEED'
+    vin_col = 'VIN'
+    driver_id_col = 'DRIVER_ID'
+    trip_id_col = 'TRIP_ID'
+    
+    # Validate required columns
+    required_cols = [time_col, speed_col, vin_col, trip_id_col]
+    if not all(col in pdf.columns for col in required_cols):
+        # Return empty result with correct schema
+        return pd.DataFrame({
+            #'VIN': pd.Series(dtype='object'),
+            'DRIVER_ID' : pd.Series(dtype='object'),
+            'TRIP_ID': pd.Series(dtype='object'),
+            'trip_start2': pd.Series(dtype='object'),
+            'trip_end2': pd.Series(dtype='object'),
+            'duration_seconds': pd.Series(dtype='float64'),
+            'total_distance_km': pd.Series(dtype='float64'),
+            'sample_rate_hz': pd.Series(dtype='float64'),
+            'max_speed_kmh': pd.Series(dtype='float64'),
+            'avg_speed_kmh': pd.Series(dtype='float64')
+        })
+    
+    # Sort by time
+    pdf = pdf.sort_values(time_col).reset_index(drop=True)
+    
+    # Remove null values
+    pdf = pdf.dropna(subset=[time_col, speed_col])
+    
+    if len(pdf) < 2:
+        # Return single row with zeros
+        return pd.DataFrame([{
+            #'VIN': pdf[vin_col].iloc[0] if len(pdf) > 0 else None,
+            'TRIP_ID': pdf[trip_id_col].iloc[0] if len(pdf) > 0 else None,
+            'DRIVER_ID': pdf[driver_id_col].iloc[0] if len(pdf) > 0 else None,
+            'trip_start2': None,
+            'trip_end2': None,
+            'duration_seconds': 0.0,
+            'total_distance_km': 0.0,
+            'sample_rate_hz': 0.0,
+            'max_speed_kmh': 0.0,
+            'avg_speed_kmh': 0.0
+        }])
+    
+    # Get identifiers
+    vin = pdf[vin_col].iloc[0]
+    trip_id = pdf[trip_id_col].iloc[0]
+    driver_id_col = pdf[driver_id_col].iloc[0]
+       
+    # Convert m/s to km/h if needed
+    if INPUT_SPEED_UNIT == 'ms':
+        speed_kmh = pdf[speed_col] * 3.6
+    else:
+        speed_kmh = pdf[speed_col]
+    
+    speed_kmh_corrected = speed_kmh.clip(lower=MIN_SPEED_KMH, upper=SPEED_LIMIT_KMH)
+    
+    # Convert to km/s for integration
+    speed_kms = speed_kmh_corrected / 3600.0
+
+    times = pdf[time_col].values
+    speeds_kms = speed_kms.values
+    speeds_kmh = speed_kmh_corrected.values
+    
+    start_time = float(times[0])
+    end_time = float(times[-1])
+    
+    # Calculate sample period (median for robustness)
+    time_deltas = np.diff(times)
+    sample_period = float(np.median(time_deltas))
+    sample_rate_hz = 1.0 / sample_period if sample_period > 0 else 0.0
+    
+    duration_seconds = (len(times) - 1) * sample_period
+
+    distance_km = float(np.trapz(speeds_kms, dx=sample_period))
+    
+    # Speed statistics
+    max_speed_kmh = float(np.max(speeds_kmh))
+    avg_speed_kmh = float(np.mean(speeds_kmh))
+    
+    from datetime import datetime
+    trip_start_str = datetime.fromtimestamp(start_time).isoformat()
+    trip_end_str = datetime.fromtimestamp(end_time).isoformat()
+    
+    return pd.DataFrame([{
+        'TRIP_ID': trip_id,
+        'DRIVER_ID': driver_id_col,
+        'trip_start2': trip_start_str,
+        'trip_end2': trip_end_str,
+        'duration_seconds': duration_seconds,
+        'total_distance_km': distance_km,
+        'sample_rate_hz': sample_rate_hz,
+        'max_speed_kmh': max_speed_kmh,
+        'avg_speed_kmh': avg_speed_kmh
+    }])
+
+# ============
