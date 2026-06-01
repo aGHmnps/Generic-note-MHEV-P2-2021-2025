@@ -1,0 +1,1359 @@
+CONFIG_stops = {
+    'engine_stop_threshold': 500,
+    'lookback_seconds': 5,
+    'freq': 100,
+    'engine_rpm_min': 0,
+    'engine_rpm_max': 5000,
+}
+
+
+def assign_bin_index_exact(values, bins):
+    values = np.asarray(values, dtype=float)
+    out = np.full(values.shape, np.nan)
+    for i in range(len(bins) - 1):
+        low, high = bins[i], bins[i + 1]
+        if i == 0:
+            mask = (values >= low) & (values <= high)
+        else:
+            mask = (values > low) & (values <= high)
+        out[mask] = i
+    return out
+
+def _get_bin_metadata(bins):
+    if len(bins) < 2:
+        return "min=0;max=0;step=0"
+    bin_min = bins[0]
+    bin_max = bins[-1]
+    step = bins[1] - bins[0] if len(bins) > 1 else 0
+    if float(step).is_integer():
+        return f"min={int(bin_min)};max={int(bin_max)};step={int(step)}"
+    return f"min={bin_min};max={bin_max};step={step}"
+
+def _build_bin_label(i, low, high, unit):
+    idx_str = f"{i:04d}"
+    low_str = str(int(low)) if float(low).is_integer() else str(low)
+    high_str = str(int(high)) if float(high).is_integer() else str(high)
+    if i == 0:
+        return f"{idx_str} [{low_str}{unit}:{high_str}{unit}]"
+    else:
+        return f"{idx_str} ]{low_str}{unit}:{high_str}{unit}]"
+
+def _build_all_bin_labels(bins, unit):
+    labels = []
+    for i in range(len(bins) - 1):
+        labels.append(_build_bin_label(i, bins[i], bins[i + 1], unit))
+    return labels
+
+def detect_engine_stops_gw(rpm_values, stop_threshold=500):
+    """
+    GW logic: count sections where RPM < stop_threshold.
+    Each transition from RPM >= threshold to RPM < threshold = one stop event.
+    Edge case: if signal starts below threshold, count as first section.
+    """
+    rpm = np.asarray(rpm_values, dtype=float)
+    n = len(rpm)
+    if n < 2:
+        return []
+    stop_indices = []
+    was_above = rpm[0] >= stop_threshold
+    if not was_above:
+        stop_indices.append(0)
+    for i in range(1, n):
+        is_above = rpm[i] >= stop_threshold
+        if was_above and not is_above:
+            stop_indices.append(i)
+        was_above = is_above
+    return stop_indices
+
+def ICE_stops_per_trip(pdf: pd.DataFrame) -> pd.DataFrame:
+    """
+    applyInPandas function: counts ICE engine stops (GW logic) per trip.
+    
+    Stop = RPM crosses from >= 500 to < 500 (section where arret_mth == 1).
+    
+    Output schema:
+        DRIVER_ID: str
+        TRIP_ID: double
+        nbr_arret_mth_demarage_veh_roulant: double (count of stops)
+    """
+    pdf = pdf.copy()
+
+    if pdf.empty:
+        return pd.DataFrame(columns=[
+            "DRIVER_ID",
+            "TRIP_ID",
+            "nbr_arret_mth_demarage_veh_roulant"
+        ])
+
+    pdf = pdf.sort_values("TIMESTAMP").reset_index(drop=True)
+
+    driver_id = str(pdf["DRIVER_ID"].iloc[0]) if "DRIVER_ID" in pdf.columns else ""
+    trip_id = float(pdf["TRIP_ID"].iloc[0]) if "TRIP_ID" in pdf.columns else 0.0
+
+    rpm_values = pd.to_numeric(pdf["REGIME_MOTEUR"], errors="coerce").values.astype(float)
+    rpm_values = np.clip(rpm_values, CONFIG_stops['engine_rpm_min'], CONFIG_stops['engine_rpm_max'])
+
+    # GW logic: sections where RPM < 500
+    stop_indices = detect_engine_stops_gw(
+        rpm_values,
+        stop_threshold=CONFIG_stops['engine_stop_threshold']
+    )
+
+    return pd.DataFrame([{
+        "DRIVER_ID": driver_id,
+        "TRIP_ID": trip_id,
+        "nbr_arret_mth_demarage_veh_roulant": float(len(stop_indices))
+    }])
+
+# Schema
+ICE_stops_per_trip_schema = StructType([
+    StructField("DRIVER_ID", StringType(), True),
+    StructField("TRIP_ID", DoubleType(), True),
+    StructField("nbr_arret_mth_demarage_veh_roulant", DoubleType(), True),
+])
+
+# ============================================================
+# GLYPHWORKS PREPROCESSING — RPM RISING RAMP ISOLATOR
+# ============================================================
+def glyphworks_preprocess_regime(regime_raw):
+    """
+    GlyphWorks signal preprocessing for engine RPM.
+    Pass 1: Keep only rising samples where RPM <= 700, zero out the rest.
+    Pass 2: Zero out incomplete ramps that never reach > 500.
+    """
+    regime = np.array(regime_raw, dtype=np.float32).copy()
+    n = len(regime)
+
+    if n < 2:
+        return regime
+
+    for pt in range(n - 1):
+        if pt == 0:
+            pass
+        elif regime[pt] <= 700 and regime[pt + 1] >= regime[pt]:
+            pass
+        else:
+            regime[pt] = 0
+
+    deb = 0
+    for pt in range(n - 1):
+        if regime[pt] == 0 and regime[pt + 1] >= regime[pt]:
+            deb = pt + 1
+        if regime[pt + 1] > 500:
+            deb = 0
+        if regime[pt] > 0 and regime[pt + 1] == 0 and regime[pt] < 500:
+            fin = pt
+            for dec in range(deb, fin, 1):
+                regime[dec] = 0
+
+    return regime
+
+
+# ============================================================
+# ICE STARTS — MAIN APPLYINPANDAS FUNCTION
+# ============================================================
+def ICE_starts_per_trip(pdf: pd.DataFrame) -> pd.DataFrame:
+    """
+    applyInPandas function: counts ICE engine starts (GW logic) per trip.
+
+    1. Preprocess RPM with GlyphWorks rising-ramp isolator
+    2. demarrage_mth = 1 if processed_rpm > 0, else 0
+    3. Count 0->1 transitions in demarrage_mth
+    4. Classify by ORIGINAL speed at transition point:
+       - speed > 0.5 km/h  => veh_roulant
+       - speed <= 0.5 km/h => veh_arrete
+
+    Output schema:
+        DRIVER_ID: str
+        TRIP_ID: double
+        nbr_demarrage_mth_veh_roulant: double
+        nbr_demarrage_mth_veh_arrete: double
+    """
+    pdf = pdf.copy()
+
+    if pdf.empty:
+        return pd.DataFrame(columns=[
+            "DRIVER_ID",
+            "TRIP_ID",
+            "nbr_demarrage_mth_veh_roulant",
+            "nbr_demarrage_mth_veh_arrete"
+        ])
+
+    pdf = pdf.sort_values("TIMESTAMP").reset_index(drop=True)
+
+    driver_id = str(pdf["DRIVER_ID"].iloc[0]) if "DRIVER_ID" in pdf.columns else ""
+    trip_id = float(pdf["TRIP_ID"].iloc[0]) if "TRIP_ID" in pdf.columns else 0.0
+
+    rpm_values = pd.to_numeric(pdf["REGIME_MOTEUR"], errors="coerce").fillna(0).values.astype(np.float32)
+    rpm_values = np.clip(rpm_values, CONFIG_stops['engine_rpm_min'], CONFIG_stops['engine_rpm_max'])
+
+    speed_values = pd.to_numeric(pdf["VEHICLE_SPEED"], errors="coerce").fillna(0).values.astype(float)
+
+    # Step 1: Preprocess RPM
+    regime_processed = glyphworks_preprocess_regime(rpm_values)
+
+    # Step 2: Demarrage = 1 if processed RPM > 0
+    demarrage = (regime_processed > 0).astype(int)
+
+    # Step 3 & 4: Count 0->1 transitions, classify by ORIGINAL speed
+    num_roulant = 0
+    num_arrete = 0
+    n = len(demarrage)
+
+    for i in range(1, n):
+        if demarrage[i - 1] == 0 and demarrage[i] == 1:
+            if speed_values[i] > 0.5:
+                num_roulant += 1
+            else:
+                num_arrete += 1
+
+    return pd.DataFrame([{
+        "DRIVER_ID": driver_id,
+        "TRIP_ID": trip_id,
+        "nbr_demarrage_mth_veh_roulant": float(num_roulant),
+        "nbr_demarrage_mth_veh_arrete": float(num_arrete)
+    }])
+
+# Code trips BS
+# =================================================================================================
+import numpy as np
+import json
+from pyspark.sql.types import StructType, StructField, StringType, DoubleType
+import pandas as pd
+import numpy as np
+import json
+
+from numpy import mean, std, sum, array
+
+def GetStartEndSection(a):
+    iszero = np.concatenate(([1], np.equal(a, 0).view(np.int8), [1]))
+    absdiff = np.abs(np.diff(iszero))
+    ranges = np.where(absdiff == 1)[0].reshape(-1, 2)
+    ranges=[[x[0],x[1]-1] for x in ranges]
+    return ranges
+
+def H1DOCCURRENCE(p_signal,p_Bins,p_Unit,p_roulage):
+    Classes=["MODE"+str(p_Bins[1])]+["MODE"+str(p_Bins[i+1]) for i in range(1,len(p_Bins)-2)] + ["MODE "+str(p_Bins[-1])+"-14"]
+    occ=[]
+    np_signal=np.array(p_signal,dtype = float)
+    occurrence_i=len(GetStartEndSection(1*((np_signal>=p_Bins[0]) & (np_signal<=p_Bins[1]))))
+    occ.append(occurrence_i)
+    for i in range(1,len(p_Bins)-1):
+        occurrence_i=len(GetStartEndSection(1*((np_signal>p_Bins[i]) & (np_signal<=p_Bins[i+1]))))
+        occ.append(occurrence_i)
+    return dict(zip(Classes,occ))
+
+def H2DDUREE(p_Time,p_signalX,p_signalY,p_BinsX,p_UnitX,p_BinsY,p_UnitY,p_roulage):
+    import numpy as np
+    from numpy import mean, sum
+    np_signalX=np.array(p_signalX,dtype = float)
+    np_signalY=np.array(p_signalY,dtype = float)
+    dt=mean(np.diff(p_Time))
+    duree=np.append(np.diff(p_Time),0)
+    ClassesX=["roulage"]+[""]+["["+str(p_BinsX[0])+p_UnitX+":"+str(p_BinsX[1])+p_UnitX+"]"]+["]"+str(p_BinsX[i])+p_UnitX+":"+str(p_BinsX[i+1])+p_UnitX+"]" for i in range(1,len(p_BinsX)-1)]
+    ClassesY=["["+str(p_BinsY[0])+p_UnitY+":"+str(p_BinsY[1])+p_UnitY+"]"]+["]"+str(p_BinsY[i])+p_UnitY+":"+str(p_BinsY[i+1])+p_UnitY+"]" for i in range(1,len(p_BinsY)-1)]
+    H2D=[]
+    H2D.append(ClassesX)
+    for j in range(len(p_BinsY)-1):
+        hist=[]
+        hist.append(p_roulage)
+        hist.append(ClassesY[j])
+        for i in range(len(p_BinsX)-1):            
+            duree_i=sum(duree[((np_signalX>p_BinsX[i]) & (np_signalX<=p_BinsX[i+1])) & ((np_signalY>p_BinsY[j]) & (np_signalY<=p_BinsY[j+1]))])
+            hist.append(duree_i)
+        H2D.append(hist)
+    return H2D
+
+def BS_H2D_duree_trips_matrix(pdf):
+    driver_id = str(pdf['DRIVER_ID'].iloc[0])
+    trip_id = pdf['TRIP_ID'].iloc[0]    
+    p_BinsX = [x for x in range(-100, 6950, 50)]  # RPM bins
+    p_BinsY = [y for y in range(-120, 115, 5)]    # Torque bins
+    
+    x_min = min(p_BinsX)
+    x_max = max(p_BinsX)
+    x_step = np.mean(np.diff(p_BinsX))
+    y_min = min(p_BinsY)
+    y_max = max(p_BinsY)
+    y_step = np.mean(np.diff(p_BinsY))
+    p_UnitX = "RPM"
+    p_UnitY = "N.m"
+    
+    p_roulage = f"{driver_id}_{str(trip_id)}"
+    
+    # try:
+
+    matrix_data = H2DDUREE(
+        pdf['TIMESTAMP'],
+        pdf['REGIME_MEL_RPM'],
+        pdf['COUPLE_MEL'],
+        p_BinsX,
+        p_UnitX,
+        p_BinsY,
+        p_UnitY,
+        p_roulage
+    )
+
+    rpm_bins = matrix_data[0][2:]
+    torque_bins = [row[1] for row in matrix_data[1:]]
+    values = [row[2:] for row in matrix_data[1:]]
+    matrix_nested ={}
+
+    for i, torque_bin in enumerate(torque_bins):
+        for j, rpm_bin in enumerate(rpm_bins):
+            value = float(values[i][j]) if values[i][j] is not None else 0.0
+            
+            # Create nested structure
+            if rpm_bin not in matrix_nested:
+                matrix_nested[rpm_bin] = {}
+            
+            matrix_nested[rpm_bin][torque_bin] = {"none": value}
+    
+    h2d_json_obj = {
+        "x_axis": "REGIME_MEL_RPM",
+        "y_axis": "COUPLE_MEL",
+        "x_bins": f"min={x_min};max={x_max};step={x_step}",
+        "y_bins": f"min={y_min};max={y_max};step={y_step}",
+        "matrix": matrix_nested
+    }
+    
+    # Convert to JSON string
+    h2d_json = json.dumps(h2d_json_obj)
+        
+    # except Exception as e:
+    #     print(f"Error processing DRIVER_ID={driver_id}, TRIP_ID={trip_id}: {e}")
+    #     h2d_json = None
+    
+    return pd.DataFrame([{
+        'DRIVER_ID': driver_id,
+        'TRIP_ID': float(trip_id),
+        'h2d_matrix_json': h2d_json
+    }])
+
+import pandas as pd
+import numpy as np
+import json
+
+p_BinsX = [x for x in range(-100, 8050, 50)]
+p_BinsY = [y for y in range(-500, 500, 5)]
+
+p_UnitX = "RPM"
+p_UnitY = "N.m"
+
+CONFIG_dict = {
+
+    'thresholds': {
+        'engine_rpm_max': 8000,
+        'engine_rpm_min': 0,
+        'vehicle_speed_max': 250,
+        'vehicle_speed_min': 0,
+        'mel_rpm_min': 0,
+        'engine_on_threshold': 50,
+        'vehicle_moving_threshold': 0.50
+    }
+}
+def _get_bin_metadata(bins):
+    if len(bins) < 2:
+        return "min=0;max=0;step=0"
+    bin_min = bins[0]
+    bin_max = bins[-1]
+    step = bins[1] - bins[0] if len(bins) > 1 else 0
+    if float(step).is_integer():
+        return f"min={int(bin_min)};max={int(bin_max)};step={int(step)}"
+    return f"min={bin_min};max={bin_max};step={step}"
+
+
+def _build_bin_label(i, low, high, unit):
+    """
+    Build label like:
+      i=0:  '0000 [-100RPM:-50RPM]'
+      i=1:  '0001 ]-50RPM:0RPM]'
+      i=67: '0067 ]0N.m:5N.m]'
+    """
+    # Zero-pad index to 4 digits
+    idx_str = f"{i:04d}"
+
+    # Format low/high as integers if possible
+    low_str = str(int(low)) if float(low).is_integer() else str(low)
+    high_str = str(int(high)) if float(high).is_integer() else str(high)
+
+    if i == 0:
+        return f"{idx_str} [{low_str}{unit}:{high_str}{unit}]"
+    else:
+        return f"{idx_str} ]{low_str}{unit}:{high_str}{unit}]"
+
+
+def _build_all_bin_labels(bins, unit):
+    """Pre-build all bin labels for fast lookup by index."""
+    labels = []
+    for i in range(len(bins) - 1):
+        labels.append(_build_bin_label(i, bins[i], bins[i + 1], unit))
+    return labels
+
+
+def assign_bin_index_exact(values, bins):
+    """
+    first bin:  >= low and <= high
+    other bins: > low and <= high
+    """
+    values = np.asarray(values, dtype=float)
+    out = np.full(values.shape, np.nan)
+    for i in range(len(bins) - 1):
+        low, high = bins[i], bins[i + 1]
+        if i == 0:
+            mask = (values >= low) & (values <= high)
+        else:
+            mask = (values > low) & (values <= high)
+        out[mask] = i
+    return out
+
+
+def _create_empty_json_with_metadata(x_col, y_col, x_bins, y_bins):
+    result = {
+        "x_axis": x_col,
+        "y_axis": y_col,
+        "x_bins": _get_bin_metadata(x_bins),
+        "y_bins": _get_bin_metadata(y_bins),
+        "matrix": {}
+    }
+    return json.dumps(result, separators=(',', ':'))
+
+    
+def _calculate_h2d_matrix_json_count(df, x_col, y_col, x_bins, y_bins, x_unit, y_unit, freq=100):
+    """
+    H2D duration matrix with nested dict format and indexed bin labels:
+      "matrix": {
+          "0000 [-100RPM:-50RPM]": {
+              "0000 [-120N.m:-115N.m]": {"none": 0.01},
+              "0001 ]-115N.m:-110N.m]": {"none": 1.23}
+          },
+          "0001 ]-50RPM:0RPM]": { ... }
+      }
+    """
+    dt = 1.0 / freq
+
+    if df.empty or x_col not in df.columns or y_col not in df.columns:
+        return _create_empty_json_with_metadata(x_col, y_col, x_bins, y_bins)
+
+    tmp = df[[x_col, y_col]].copy()
+    x_vals = pd.to_numeric(tmp[x_col], errors="coerce").values
+    y_vals = pd.to_numeric(tmp[y_col], errors="coerce").values
+
+    valid_mask = ~(np.isnan(x_vals) | np.isnan(y_vals))
+    x_vals = x_vals[valid_mask]
+    y_vals = y_vals[valid_mask]
+
+    if len(x_vals) == 0:
+        return _create_empty_json_with_metadata(x_col, y_col, x_bins, y_bins)
+
+    x_idx = assign_bin_index_exact(x_vals, x_bins)
+    y_idx = assign_bin_index_exact(y_vals, y_bins)
+
+    valid_bins = ~(np.isnan(x_idx) | np.isnan(y_idx))
+    x_idx = x_idx[valid_bins].astype(int)
+    y_idx = y_idx[valid_bins].astype(int)
+
+    if len(x_idx) == 0:
+        return _create_empty_json_with_metadata(x_col, y_col, x_bins, y_bins)
+
+    # Pre-build label lookup arrays (original format with index prefix)
+    x_labels = _build_all_bin_labels(x_bins, x_unit)
+    y_labels = _build_all_bin_labels(y_bins, y_unit)
+
+    # Accumulate durations by bin index pair
+    matrix_acc = {}
+    for xi, yi in zip(x_idx, y_idx):
+        key = (int(xi), int(yi))
+        matrix_acc[key] = matrix_acc.get(key, 0.0) + dt
+
+    # Convert to nested dict format
+    matrix = {}
+    for (key_x, key_y), value in sorted(matrix_acc.items(), key=lambda kv: (kv[0][0], kv[0][1])):
+        x_label = x_labels[key_x]
+        y_label = y_labels[key_y]
+        if x_label not in matrix:
+            matrix[x_label] = {}
+        matrix[x_label][y_label] = {"none": round(value, 6)}
+
+    result = {
+        "x_axis": x_col,
+        "y_axis": y_col,
+        "x_bins": _get_bin_metadata(x_bins),
+        "y_bins": _get_bin_metadata(y_bins),
+        "matrix": matrix
+    }
+
+    return json.dumps(result, separators=(',', ':'))
+
+def ICE_duration_veh_roulant_per_gear_trips(pdf: pd.DataFrame) -> pd.DataFrame:
+    pdf = pdf.copy()
+
+    if pdf.empty:
+        return pd.DataFrame(columns=[
+            "DRIVER_ID",
+            "TRIP_ID",
+            "mode",
+            "h2d_duree_ICE_duration_veh_roulant_per_gear_trips_matrix_json"
+        ])
+
+    pdf = pdf.sort_values("TIMESTAMP").reset_index(drop=True)
+
+    driver_id = str(pdf["DRIVER_ID"].iloc[0]) if "DRIVER_ID" in pdf.columns else ""
+    trip_id = float(pdf["TRIP_ID"].iloc[0]) if "TRIP_ID" in pdf.columns else 0.0
+
+    results = []
+
+    for rapport_boite_engage in range(0, 7):
+            df_with_events = pdf[[
+                "DRIVER_ID",
+                "TRIP_ID",
+                "TIMESTAMP",
+                "REGIME_MOTEUR",
+                "COUPLE_MOTEUR",
+                "VEHICLE_SPEED",
+                "RAPPORT_BOITE"
+            ]].copy()
+
+            # corrections des signaux
+            df_with_events["REGIME_MOTEUR"] = np.where(
+                df_with_events["REGIME_MOTEUR"] < CONFIG_dict['thresholds']['engine_rpm_min'],
+                CONFIG_dict['thresholds']['engine_rpm_min'],
+                np.where(
+                    df_with_events["REGIME_MOTEUR"] >= CONFIG_dict['thresholds']['engine_rpm_max'],
+                    CONFIG_dict['thresholds']['engine_rpm_max'],
+                    df_with_events["REGIME_MOTEUR"]
+                )
+            )
+
+            df_with_events["VEHICLE_SPEED"] = np.where(
+                df_with_events["VEHICLE_SPEED"] < CONFIG_dict['thresholds']['vehicle_speed_min'],
+                CONFIG_dict['thresholds']['vehicle_speed_min'],
+                np.where(
+                    df_with_events["VEHICLE_SPEED"] >= CONFIG_dict['thresholds']['vehicle_speed_max'],
+                    CONFIG_dict['thresholds']['vehicle_speed_max'],
+                    df_with_events["VEHICLE_SPEED"]
+                )
+            )
+
+            # event condition
+            event_condition = (
+                (df_with_events["VEHICLE_SPEED"] >= CONFIG_dict['thresholds']['vehicle_moving_threshold']) &
+                (df_with_events["RAPPORT_BOITE"] == rapport_boite_engage)
+            )
+
+            df_with_events["event_signal"] = np.where(event_condition, 1, 0)
+
+            # segment logic kept, even if not used later, because you said not to alter
+            prev_event = df_with_events["event_signal"].shift(1, fill_value=0)
+            start_of_segment = ((prev_event == 0) & (df_with_events["event_signal"] == 1)).astype(int)
+            df_with_events["segment_id"] = start_of_segment.cumsum()
+
+            # filter event_signal == 1
+            df_filtered = df_with_events[df_with_events["event_signal"] == 1].copy()
+
+            # exactly like your current code
+            df_valid = df_filtered.copy()
+
+            if df_valid.empty:
+                h2d_json = _create_empty_json_with_metadata(
+                    x_col="REGIME_MOTEUR",
+                    y_col="COUPLE_MOTEUR",
+                    x_bins=p_BinsX,
+                    y_bins=p_BinsY
+                )
+            else:
+                h2d_json = _calculate_h2d_matrix_json_count(
+                    df=df_valid,
+                    x_col="REGIME_MOTEUR",
+                    y_col="COUPLE_MOTEUR",
+                    x_bins=p_BinsX,
+                    y_bins=p_BinsY,
+                    x_unit=p_UnitX,
+                    y_unit=p_UnitY,
+                    freq=100
+                )
+
+            results.append({
+                "DRIVER_ID": driver_id,
+                "TRIP_ID": trip_id,
+                "mode": f"gear_{rapport_boite_engage}",
+                "h2d_duree_ICE_duration_veh_roulant_per_gear_trips_matrix_json": h2d_json
+            })
+
+    return pd.DataFrame(results)
+
+#########################"DRIVER LEVEL
+# 1) Function code
+# =================================================================================================
+import pandas as pd
+import numpy as np
+from collections import Counter
+from pyspark.sql import functions as F
+import json
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DoubleType, DateType
+
+# Helper: sum dicts (or JSON strings) key by key
+def sum_dicts(dicts):
+    total = Counter()
+    for d in dicts:
+        if isinstance(d, dict):
+            total.update(d)
+        elif isinstance(d, str):
+            try:
+                total.update(json.loads(d))  # handle JSON-like strings
+            except:
+                pass
+    return dict(total)
+
+def myfunc_dev_driver(pdf: pd.DataFrame) -> pd.DataFrame:
+    final_columns = [
+        #'VIN', 
+        'DRIVER_ID','month', 'year', 'trip_start', 'trip_end',
+        'total_duration_seconds', 'total_duration_hours', 'total_distance_km', 
+        'avg_sample_rate_hz', 'max_speed_kmh', 'avg_speed_kmh'
+    ]
+    
+    # Check for empty input DataFrame for the current VIN group
+    if pdf.empty:
+        return pd.DataFrame({col: pd.Series(dtype=np.dtype('object')) if col in ['DRIVER_ID', 'trip_start', 'trip_end'] else pd.Series(dtype=np.float64) 
+                             for col in final_columns})
+
+    aggregation_funcs = {
+        'trip_start': ('trip_start', 'min'), 
+        'trip_end': ('trip_end', 'max'),
+        
+        'total_duration_seconds': ('duration_seconds', 'sum'),
+        'total_distance_km': ('total_distance_km', 'sum'),
+        
+        'avg_sample_rate_hz': ('sample_rate_hz', 'mean'),
+        'max_speed_kmh': ('max_speed_kmh', 'max'),
+        'avg_speed_kmh': ('avg_speed_kmh', 'mean') 
+    }
+
+    agg_df = (
+        pdf.groupby(["DRIVER_ID", "month", "year"], as_index=False)
+        .agg(**aggregation_funcs) 
+    )
+
+    # 4. Post-Aggregation Calculations (Derived Metric)
+    agg_df["total_duration_hours"] = agg_df["total_duration_seconds"] / 3600.0
+
+    if pd.api.types.is_datetime64_any_dtype(agg_df['trip_start']):
+        agg_df["trip_start"] = agg_df["trip_start"].astype(str)
+    if pd.api.types.is_datetime64_any_dtype(agg_df['trip_end']):
+        agg_df["trip_end"] = agg_df["trip_end"].astype(str)
+
+    return agg_df[final_columns]
+
+def myfunc_mel_revolutions_driver(pdf: pd.DataFrame) -> pd.DataFrame:
+    """
+    Aggregate MEL revolutions by DRIVER_ID (monthly aggregation).
+    Sums nbr_tours_MEL across all trips for each driver per month.
+    
+    Expected input columns (from nbr_tours_mel_GW output):
+    - DRIVER_ID
+    - TRIP_ID
+    - trip_start2 (ISO timestamp string)
+    - trip_end2 (ISO timestamp string)
+    - nbr_tours_MEL
+    - avg_regime_mel_rpm
+    - max_regime_mel_rpm
+    - sample_rate_hz
+    - duration_seconds
+    
+    Returns:
+    - Aggregated results grouped by DRIVER_ID, month, year
+    """
+    
+    final_columns = [
+        'DRIVER_ID', 'month', 'year', 'trip_start', 'trip_end',
+        'total_nbr_tours_MEL', 'total_duration_seconds', 'total_duration_hours',
+        'avg_regime_mel_rpm', 'max_regime_mel_rpm', 'avg_sample_rate_hz',
+        'num_trips'
+    ]
+    
+    # Check for empty input DataFrame
+    if pdf.empty:
+        return pd.DataFrame({
+            'DRIVER_ID': pd.Series(dtype='object'),
+            'month': pd.Series(dtype='int64'),
+            'year': pd.Series(dtype='int64'),
+            'trip_start': pd.Series(dtype='object'),
+            'trip_end': pd.Series(dtype='object'),
+            'total_nbr_tours_MEL': pd.Series(dtype='float64'),
+            'total_duration_seconds': pd.Series(dtype='float64'),
+            'total_duration_hours': pd.Series(dtype='float64'),
+            'avg_regime_mel_rpm': pd.Series(dtype='float64'),
+            'max_regime_mel_rpm': pd.Series(dtype='float64'),
+            'avg_sample_rate_hz': pd.Series(dtype='float64'),
+            'num_trips': pd.Series(dtype='int64')
+        })
+    
+    # Convert trip_start2 and trip_end2 to datetime for month/year extraction
+    pdf['trip_start_dt'] = pd.to_datetime(pdf['trip_start2'], errors='coerce')
+    pdf['trip_end_dt'] = pd.to_datetime(pdf['trip_end2'], errors='coerce')
+    
+    # Extract month and year from trip_start
+    pdf['month'] = pdf['trip_start_dt'].dt.month
+    pdf['year'] = pdf['trip_start_dt'].dt.year
+    
+    # Remove rows where month/year couldn't be extracted
+    pdf = pdf.dropna(subset=['month', 'year'])
+    
+    if pdf.empty:
+        return pd.DataFrame({col: pd.Series(dtype='object') if col in ['DRIVER_ID', 'trip_start', 'trip_end'] 
+                             else pd.Series(dtype='int64') if col in ['month', 'year', 'num_trips']
+                             else pd.Series(dtype='float64') 
+                             for col in final_columns})
+    
+    # Define aggregation functions
+    aggregation_funcs = {
+        'trip_start': ('trip_start2', 'min'),
+        'trip_end': ('trip_end2', 'max'),
+        
+        # SUM of MEL revolutions (main metric)
+        'total_nbr_tours_MEL': ('nbr_tours_MEL', 'sum'),
+        
+        # SUM of duration
+        'total_duration_seconds': ('duration_seconds', 'sum'),
+        
+        # AVERAGE of regime metrics
+        'avg_regime_mel_rpm': ('avg_regime_mel_rpm', 'mean'),
+        'max_regime_mel_rpm': ('max_regime_mel_rpm', 'max'),
+        'avg_sample_rate_hz': ('sample_rate_hz', 'mean'),
+        
+        # COUNT of trips
+        'num_trips': ('TRIP_ID', 'count')
+    }
+    
+    # Perform aggregation by DRIVER_ID, month, year
+    agg_df = (
+        pdf.groupby(["DRIVER_ID", "month", "year"], as_index=False)
+        .agg(**aggregation_funcs)
+    )
+    
+    # Post-Aggregation Calculations
+    agg_df["total_duration_hours"] = agg_df["total_duration_seconds"] / 3600.0
+    
+    # Ensure trip_start and trip_end are strings (not datetime)
+    if pd.api.types.is_datetime64_any_dtype(agg_df['trip_start']):
+        agg_df["trip_start"] = agg_df["trip_start"].astype(str)
+    if pd.api.types.is_datetime64_any_dtype(agg_df['trip_end']):
+        agg_df["trip_end"] = agg_df["trip_end"].astype(str)
+    
+    # Ensure correct data types
+    agg_df['month'] = agg_df['month'].astype('int64')
+    agg_df['year'] = agg_df['year'].astype('int64')
+    agg_df['num_trips'] = agg_df['num_trips'].astype('int64')
+    
+    return agg_df[final_columns]
+
+def duree_fonctionnement_MEL_driver(pdf: pd.DataFrame) -> pd.DataFrame:
+    """
+    Aggregate duree_fonctionnement from trip-level to driver-level per mode.
+    
+    """
+    # Handle empty DataFrame
+    if pdf.empty:
+        return pd.DataFrame({
+            'DRIVER_ID': [''],
+            'month': [0],
+            'year': [0],
+            'trip_start': [''],
+            'trip_end': [''],
+            'avg_duree_vehicule_arrete': [0.0],
+            'avg_duree_roulant_mth_off': [0.0],
+            'avg_duree_roulant_mth_demarre': [0.0],
+            'avg_duree_mode_boost': [0.0],
+            'avg_duree_mode_recharge_batterie': [0.0],
+            'avg_duree_mode_freinage_regeneratif': [0.0],
+            'avg_duree_mode_zev': [0.0],
+            'total_duration_seconds': [0.0],
+            'total_duration_hours': [0.0],
+            'avg_sample_rate_hz': [0.0],
+            'num_trips': [0]
+        })
+    
+    # Extract driver metadata
+    driver_id = str(pdf['DRIVER_ID'].iloc[0])
+    
+    # Get earliest trip start and latest trip end
+    try:
+        from datetime import datetime
+        # Parse trip_start2 and trip_end2
+        trip_starts = pd.to_datetime(pdf['trip_start2'])
+        trip_ends = pd.to_datetime(pdf['trip_end2'])
+        
+        earliest_start = trip_starts.min()
+        latest_end = trip_ends.max()
+        
+        trip_start_str = earliest_start.strftime('%Y-%m-%d %H:%M:%S')
+        trip_end_str = latest_end.strftime('%Y-%m-%d %H:%M:%S')
+        
+        # Extract month and year from earliest trip
+        month = int(earliest_start.month)
+        year = int(earliest_start.year)
+    except:
+        trip_start_str = str(pdf['trip_start2'].iloc[0])
+        trip_end_str = str(pdf['trip_end2'].iloc[-1])
+        month = 0
+        year = 0
+    
+    # Count unique trips
+    num_trips = int(pdf['TRIP_ID'].nunique())
+    
+    # Calculate average sample rate
+    avg_sample_rate_hz = float(pdf['sample_rate_hz'].mean())
+    
+    mode_columns = [
+        'vehicule_arrete_duree_fonctionnement',
+        'roulant_mth_off_duree_fonctionnement',
+        'roulant_mth_demarre_duree_fonctionnement',
+        'mode_boost_duree_fonctionnement',
+        'mode_recharge_batterie_duree_fonctionnement',
+        'mode_freinage_regeneratif_duree_fonctionnement',
+        'mode_zev_duree_fonctionnement'
+    ]
+    
+    # Calculate average for each mode column
+    mode_averages = {}
+    for mode_col in mode_columns:
+        if mode_col in pdf.columns:
+            # Average across all trips for this driver
+            avg_duration = float(pdf[mode_col].mean())
+        else:
+            avg_duration = 0.0
+        
+        # Convert column name: "vehicule_arrete_duree_fonctionnement" -> "avg_duree_vehicule_arrete"
+        mode_name = mode_col.replace('_duree_fonctionnement', '')
+        mode_averages[f'avg_duree_{mode_name}'] = avg_duration
+    
+    if 'total_trip_duration_seconds' in pdf.columns:
+        total_duration_seconds = float(pdf['total_trip_duration_seconds'].sum())
+    else:
+        # Fallback: sum all mode durations across all trips
+        total_duration_seconds = float(pdf[mode_columns].sum().sum())
+    
+    total_duration_hours = total_duration_seconds / 3600.0
+    
+    result = {
+        'DRIVER_ID': driver_id,
+        'month': month,
+        'year': year,
+        'trip_start': trip_start_str,
+        'trip_end': trip_end_str,
+        **mode_averages,  # Unpack all mode averages
+        'total_duration_seconds': total_duration_seconds,
+        'total_duration_hours': total_duration_hours,
+        'avg_sample_rate_hz': avg_sample_rate_hz,
+        'num_trips': num_trips
+    }
+    
+    return pd.DataFrame([result])
+
+def MEL_H2D_aggregate_sparse_matrices_todriverLevel(pdf: pd.DataFrame) -> pd.DataFrame:
+    """
+    Aggregate sparse H2D matrices for a single driver across all trips.
+    
+    Input: pandas DataFrame for one DRIVER_ID (multiple trips)
+    Output: pandas DataFrame with 1 row (aggregated driver-level data)
+    """
+    
+    # Initialize result dictionary
+    result = {
+        'DRIVER_ID': pdf['DRIVER_ID'].iloc[0],
+        'month': int(pdf['month'].mode().iloc[0]) if pd.notna(pdf['month'].mode().iloc[0]) else None,
+        'year': int(pdf['year'].mode().iloc[0]) if pd.notna(pdf['year'].mode().iloc[0]) else None,
+        'num_trips': int(len(pdf)),
+        
+        # Aggregate trip-level metrics (sums)
+        'total_duration_trip_h': float(pdf['duration_trip_h'].sum()),
+        'total_distance_trip_integral_km': float(pdf['distance_trip_integral_km'].sum()),
+        'total_sum_distance_CITY_km': float(pdf['sum_distance_CITY_km'].sum()),
+        'total_sum_distance_ROAD_km': float(pdf['sum_distance_ROAD_km'].sum()),
+        'total_sum_distance_HIGHWAY_km': float(pdf['sum_distance_HIGHWAY_km'].sum()),
+    }
+    
+    # Aggregate each of the 7 H2D modes
+    mode_columns = [
+        'H2D_duree_MEL_mode_1', 'H2D_duree_MEL_mode_2', 'H2D_duree_MEL_mode_3',
+        'H2D_duree_MEL_mode_4', 'H2D_duree_MEL_mode_5', 'H2D_duree_MEL_mode_6',
+        'H2D_duree_MEL_mode_7'
+    ]
+    
+    for mode_col in mode_columns:
+        # Initialize aggregated matrix storage
+        aggregated_matrix = {}
+        metadata = None
+        
+        # Process each trip's matrix for this mode
+        for json_str in pdf[mode_col].dropna():
+            try:
+                data = json.loads(json_str)
+                
+                # Extract metadata (same for all trips in this mode)
+                if metadata is None:
+                    metadata = {
+                        'x_axis': data.get('x_axis', ''),
+                        'y_axis': data.get('y_axis', ''),
+                        'x_bins': data.get('x_bins', ''),
+                        'y_bins': data.get('y_bins', '')
+                    }
+                
+                # Sum matrix values by bin coordinates
+                trip_matrix = data.get('matrix', {})
+                for coord, value in trip_matrix.items():
+                    if coord in aggregated_matrix:
+                        aggregated_matrix[coord] += float(value)
+                    else:
+                        aggregated_matrix[coord] = float(value)
+                        
+            except (json.JSONDecodeError, TypeError, KeyError) as e:
+                # Skip invalid JSON or malformed data
+                continue
+        
+        # Store aggregated result as JSON string
+        if aggregated_matrix and metadata:
+            result_json = {
+                **metadata,
+                'matrix': aggregated_matrix
+            }
+            result[f'{mode_col}_agg'] = json.dumps(result_json)
+        else:
+            result[f'{mode_col}_agg'] = None
+    
+    return pd.DataFrame([result])
+
+def nbr_occurences_demmarage_redemarage_ICE_driver(pdf: pd.DataFrame) -> pd.DataFrame:
+    if pdf.empty:
+        return pd.DataFrame([{
+            'DRIVER_ID': None,
+            'month': None,
+            'year': None,
+            'max_nbr_occurences_demmarage_redemarage_ICE': 0,
+            'avg_nbr_occurences': 0.0
+        }])
+    
+    driver_id = pdf['DRIVER_ID'].iloc[0]
+
+    from datetime import datetime
+
+    trip_starts = pd.to_datetime(pdf['trip_start'])
+    trip_ends = pd.to_datetime(pdf['trip_end'])
+    
+    earliest_start = trip_starts.min()
+    latest_end = trip_ends.max()
+    
+    trip_start_str = earliest_start.strftime('%Y-%m-%d %H:%M:%S')
+    trip_end_str = latest_end.strftime('%Y-%m-%d %H:%M:%S')
+    
+    # Extract month and year from earliest trip
+    month = int(earliest_start.month)
+    year = int(earliest_start.year)
+
+    max_restarts = pdf['nbr_occurences_demmarage_redemarage_ICE'].max()
+    total_trips = len(pdf)
+    avg_restarts = pdf['nbr_occurences_demmarage_redemarage_ICE'].mean()
+    
+    return pd.DataFrame([{
+        'DRIVER_ID': driver_id,
+        'month' : month,
+        'year' : year,
+        'max_nbr_occurences_demmarage_redemarage_ICE': int(max_restarts),
+        'avg_nbr_occurences': float(avg_restarts)
+    }])
+
+def aggregate_BS_h2d_matrix_to_driver_level(pdf: pd.DataFrame) -> pd.DataFrame:
+    """
+    Aggregate H2D matrices (x, y, z=none: value) for a single driver across all trips.
+    
+    Input Structure (per trip):
+    {
+        "x_axis": "regime_BS_mel",
+        "y_axis": "couple_BS_mel",
+        "x_bins": "min=-100;max=6900;step=50",
+        "y_bins": "min=-120;max=110;step=5",
+        "matrix": {
+            "torque_bin1": {
+                "rpm_bin1": {"none": value1},
+                "rpm_bin2": {"none": value2}
+            },
+            "torque_bin2": {...}
+        }
+    }
+    
+    Output: Single-row DataFrame per driver with aggregated matrix as JSON string.
+    
+    Parameters:
+    -----------
+    pdf : pd.DataFrame
+        Input DataFrame for ONE DRIVER_ID with columns:
+        - DRIVER_ID (str)
+        - month (int)
+        - year (int)
+        - h2d_matrix_json (str): JSON string of H2D matrix per trip
+    
+    Returns:
+    --------
+    pd.DataFrame with schema:
+        - DRIVER_ID
+        - month
+        - year
+        - num_trips
+        - BS_total_duration_H2D_matrix_rpm_torque_BS (aggregated JSON string)
+    """
+    
+    # Extract driver metadata
+    driver_id = pdf['DRIVER_ID'].iloc[0]
+    
+    # Get most common month/year (mode), handle NaN
+    month_mode = pdf['month'].mode()
+    year_mode = pdf['year'].mode()
+    
+    month = int(month_mode.iloc[0]) if len(month_mode) > 0 and pd.notna(month_mode.iloc[0]) else None
+    year = int(year_mode.iloc[0]) if len(year_mode) > 0 and pd.notna(year_mode.iloc[0]) else None
+    num_trips = int(len(pdf))
+    
+    # Initialize aggregation storage
+    aggregated_matrix = {}
+    metadata = None
+    
+    # Aggregate matrices across all trips for this driver
+    for json_str in pdf['h2d_matrix_json'].dropna():
+        try:
+            data = json.loads(json_str)
+            
+            # Extract metadata (same across all trips, take first valid one)
+            if metadata is None:
+                metadata = {
+                    'x_axis': data.get('x_axis', ''),
+                    'y_axis': data.get('y_axis', ''),
+                    'x_bins': data.get('x_bins', ''),
+                    'y_bins': data.get('y_bins', '')
+                }
+            
+            # Sum matrix values: navigate nested structure torque_bin -> rpm_bin -> {"none": value}
+            trip_matrix = data.get('matrix', {})
+            
+            for torque_bin, rpm_dict in trip_matrix.items():
+                if torque_bin not in aggregated_matrix:
+                    aggregated_matrix[torque_bin] = {}
+                
+                for rpm_bin, z_dict in rpm_dict.items():
+                    # Extract value from {"none": value} structure
+                    value = float(z_dict.get('none', 0.0))
+                    
+                    if rpm_bin in aggregated_matrix[torque_bin]:
+                        # Sum with existing value
+                        aggregated_matrix[torque_bin][rpm_bin]['none'] += value
+                    else:
+                        # Initialize new bin
+                        aggregated_matrix[torque_bin][rpm_bin] = {'none': value}
+                        
+        except (json.JSONDecodeError, TypeError, KeyError, AttributeError) as e:
+            # Skip invalid JSON or malformed data
+            print(f"Warning: Skipping invalid matrix for {driver_id}: {e}")
+            continue
+    
+    # Build result JSON string
+    if aggregated_matrix and metadata:
+        result_json = {
+            **metadata,
+            'matrix': aggregated_matrix
+        }
+        aggregated_json_str = json.dumps(result_json)
+    else:
+        aggregated_json_str = None
+    
+    # Return single-row DataFrame
+    return pd.DataFrame([{
+        'DRIVER_ID': driver_id,
+        'month': month,
+        'year': year,
+        'num_trips': num_trips,
+        'BS_total_duration_H2D_matrix_rpm_torque_BS': aggregated_json_str
+    }])
+
+def aggregate_ICE_stops_to_driver_level(pdf: pd.DataFrame) -> pd.DataFrame:
+    if pdf.empty:
+        return pd.DataFrame(columns=[
+            "DRIVER_ID", "month", "year",
+            "nbr_arret_mth_demarage_veh_roulant"
+        ])
+
+    driver_id = str(pdf["DRIVER_ID"].iloc[0])
+    month_val = int(pdf["month"].iloc[0]) if "month" in pdf.columns else 0
+    year_val = int(pdf["year"].iloc[0]) if "year" in pdf.columns else 0
+
+    total_stops = float(pdf["nbr_arret_mth_demarage_veh_roulant"].sum())
+
+    return pd.DataFrame([{
+        "DRIVER_ID": driver_id,
+        "month": month_val,
+        "year": year_val,
+        "nbr_arret_mth_demarage_veh_roulant": total_stops
+    }])
+def aggregate_ICE_starts_to_driver_level(pdf: pd.DataFrame) -> pd.DataFrame:
+    if pdf.empty:
+        return pd.DataFrame(columns=[
+            "DRIVER_ID", "month", "year",
+            "nbr_demarrage_mth_veh_roulant",
+            "nbr_demarrage_mth_veh_arrete"
+        ])
+
+    driver_id = str(pdf["DRIVER_ID"].iloc[0])
+    month_val = int(pdf["month"].iloc[0]) if "month" in pdf.columns else 0
+    year_val = int(pdf["year"].iloc[0]) if "year" in pdf.columns else 0
+
+    total_roulant = float(pdf["nbr_demarrage_mth_veh_roulant"].sum())
+    total_arrete = float(pdf["nbr_demarrage_mth_veh_arrete"].sum())
+
+    return pd.DataFrame([{
+        "DRIVER_ID": driver_id,
+        "month": month_val,
+        "year": year_val,
+        "nbr_demarrage_mth_veh_roulant": total_roulant,
+        "nbr_demarrage_mth_veh_arrete": total_arrete
+    }])
+# DURATION & DISTANCE CALCULATION - GLYPHWORKS LOGIC 
+
+def duree_distance_GW(pdf):
+    """
+    Calculate trip duration and distance using GlyphWorks method.
+    Designed for PySpark applyInPandas().
+    
+    Expected input columns:
+    - TIME (timestamp in seconds)
+    - VEHICLE_SPEED (speed in km/h or m/s)
+    - VIN (vehicle identifier)
+    - TRIP_ID (trip identifier)
+    
+    Returns DataFrame with schema matching myfunc_dev_schema.
+    """
+    import numpy as np
+    import pandas as pd
+    
+    # Configuration 
+    INPUT_SPEED_UNIT = 'kmh'  
+    SPEED_LIMIT_KMH = 250.0
+    MIN_SPEED_KMH = 0.0
+    
+    # mapping
+    time_col = 'TIMESTAMP_double'
+    speed_col = 'VEHICLE_SPEED'
+    vin_col = 'VIN'
+    trip_id_col = 'TRIP_ID'
+    
+    # Validate required columns
+    required_cols = [time_col, speed_col, vin_col, trip_id_col]
+    if not all(col in pdf.columns for col in required_cols):
+        # Return empty result with correct schema
+        return pd.DataFrame({
+            'VIN': pd.Series(dtype='object'),
+            'TRIP_ID': pd.Series(dtype='object'),
+            'trip_start2': pd.Series(dtype='object'),
+            'trip_end2': pd.Series(dtype='object'),
+            'duration_seconds': pd.Series(dtype='float64'),
+            'total_distance_km': pd.Series(dtype='float64'),
+            'sample_rate_hz': pd.Series(dtype='float64'),
+            'max_speed_kmh': pd.Series(dtype='float64'),
+            'avg_speed_kmh': pd.Series(dtype='float64')
+        })
+    
+    # Sort by time
+    pdf = pdf.sort_values(time_col).reset_index(drop=True)
+    
+    # Remove null values
+    pdf = pdf.dropna(subset=[time_col, speed_col])
+    
+    if len(pdf) < 2:
+        # Return single row with zeros
+        return pd.DataFrame([{
+            'VIN': pdf[vin_col].iloc[0] if len(pdf) > 0 else None,
+            'TRIP_ID': pdf[trip_id_col].iloc[0] if len(pdf) > 0 else None,
+            'trip_start2': None,
+            'trip_end2': None,
+            'duration_seconds': 0.0,
+            'total_distance_km': 0.0,
+            'sample_rate_hz': 0.0,
+            'max_speed_kmh': 0.0,
+            'avg_speed_kmh': 0.0
+        }])
+    
+    # Get identifiers
+    vin = pdf[vin_col].iloc[0]
+    trip_id = pdf[trip_id_col].iloc[0]
+       
+    # Convert m/s to km/h if needed
+    if INPUT_SPEED_UNIT == 'ms':
+        speed_kmh = pdf[speed_col] * 3.6
+    else:
+        speed_kmh = pdf[speed_col]
+    
+    speed_kmh_corrected = speed_kmh.clip(lower=MIN_SPEED_KMH, upper=SPEED_LIMIT_KMH)
+    
+    # Convert to km/s for integration
+    speed_kms = speed_kmh_corrected / 3600.0
+
+    times = pdf[time_col].values
+    speeds_kms = speed_kms.values
+    speeds_kmh = speed_kmh_corrected.values
+    
+    start_time = float(times[0])
+    end_time = float(times[-1])
+    
+    # Calculate sample period (median for robustness)
+    time_deltas = np.diff(times)
+    sample_period = float(np.median(time_deltas))
+    sample_rate_hz = 1.0 / sample_period if sample_period > 0 else 0.0
+    
+    duration_seconds = (len(times) - 1) * sample_period
+
+    distance_km = float(np.trapz(speeds_kms, dx=sample_period))
+    
+    # Speed statistics
+    max_speed_kmh = float(np.max(speeds_kmh))
+    avg_speed_kmh = float(np.mean(speeds_kmh))
+    
+    from datetime import datetime
+    trip_start_str = datetime.fromtimestamp(start_time).isoformat()
+    trip_end_str = datetime.fromtimestamp(end_time).isoformat()
+    
+    return pd.DataFrame([{
+        'VIN': vin,
+        'TRIP_ID': trip_id,
+        'trip_start2': trip_start_str,
+        'trip_end2': trip_end_str,
+        'duration_seconds': duration_seconds,
+        'total_distance_km': distance_km,
+        'sample_rate_hz': sample_rate_hz,
+        'max_speed_kmh': max_speed_kmh,
+        'avg_speed_kmh': avg_speed_kmh
+    }])
+
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DoubleType
+
+# =================================================================================================
+# 2) OUTPUT SCHEMA DEFINITION
+# =================================================================================================
+# Schema for VIN-level results
+nbr_starts_ice_driver_schema = StructType([
+    StructField("DRIVER_ID", StringType(), True),
+    StructField("month", IntegerType(), True),
+    StructField("year", IntegerType(), True),
+    StructField("nbr_demarrage_mth_veh_roulant", DoubleType(), True),
+    StructField("nbr_demarrage_mth_veh_arrete", DoubleType(), True),
+])
+from pyspark.sql.types import *
+
+nbr_stops_ice_driver_schema = StructType([
+    StructField("DRIVER_ID", StringType(), True),
+    StructField("month", IntegerType(), True),
+    StructField("year", IntegerType(), True),
+    StructField("nbr_arret_mth_demarage_veh_roulant", DoubleType(), True),
+])
+
+driver_max_schema = StructType([
+    StructField("DRIVER_ID", StringType(), False),
+    StructField("month", IntegerType(), True),
+    StructField("year", IntegerType(), True),
+    StructField("max_nbr_occurences_demmarage_redemarage_ICE", IntegerType(), True),
+    StructField("avg_nbr_occurences", DoubleType(), True)
+])
+
+myfunc_dev_driver_schema = StructType([
+    #StructField("VIN", StringType(), True),
+    StructField("DRIVER_ID", StringType(), True),
+    StructField("month", IntegerType(), True),
+    StructField("year", IntegerType(), True),
+    StructField("trip_start", StringType(), True),
+    StructField("trip_end", StringType(), True),
+    StructField("total_duration_seconds", DoubleType(), True),
+    StructField("total_duration_hours", DoubleType(), True),
+    StructField("total_distance_km", DoubleType(), True),
+    StructField("avg_sample_rate_hz", DoubleType(), True),
+    StructField("max_speed_kmh", DoubleType(), True),
+    StructField("avg_speed_kmh", DoubleType(), True)
+])
+#schema definition nbr tours mel
+mel_revolutions_driver_schema = StructType([
+    StructField("DRIVER_ID", StringType(), True),
+    StructField("month", IntegerType(), True),
+    StructField("year", IntegerType(), True),
+    StructField("trip_start", StringType(), True),
+    StructField("trip_end", StringType(), True),
+    StructField("total_nbr_tours_MEL", DoubleType(), True),
+    StructField("total_duration_seconds", DoubleType(), True),
+    StructField("total_duration_hours", DoubleType(), True),
+    StructField("avg_regime_mel_rpm", DoubleType(), True),
+    StructField("max_regime_mel_rpm", DoubleType(), True),
+    StructField("avg_sample_rate_hz", DoubleType(), True),
+    StructField("num_trips", IntegerType(), True)
+])
+duree_fonctionnement_driver_schema = StructType([
+    StructField("DRIVER_ID", StringType(), True),
+    StructField("month", IntegerType(), True),
+    StructField("year", IntegerType(), True),
+    StructField("trip_start", StringType(), True),
+    StructField("trip_end", StringType(), True),
+    StructField("avg_duree_vehicule_arrete", DoubleType(), True),
+    StructField("avg_duree_roulant_mth_off", DoubleType(), True),
+    StructField("avg_duree_roulant_mth_demarre", DoubleType(), True),
+    StructField("avg_duree_mode_boost", DoubleType(), True),
+    StructField("avg_duree_mode_recharge_batterie", DoubleType(), True),
+    StructField("avg_duree_mode_freinage_regeneratif", DoubleType(), True),
+    StructField("avg_duree_mode_zev", DoubleType(), True),
+    StructField("total_duration_seconds", DoubleType(), True),
+    StructField("total_duration_hours", DoubleType(), True),
+    StructField("avg_sample_rate_hz", DoubleType(), True),
+    StructField("num_trips", IntegerType(), True)
+])
+
+MEL_h2D_sparse_matrix_schema =StructType([
+    StructField('DRIVER_ID', StringType(), True),
+    StructField('month', IntegerType(), True),
+    StructField('year', IntegerType(), True),
+    StructField('num_trips', IntegerType(), True),
+    StructField('total_duration_trip_h', DoubleType(), True),
+    StructField('total_distance_trip_integral_km', DoubleType(), True),
+    StructField('total_sum_distance_CITY_km', DoubleType(), True),
+    StructField('total_sum_distance_ROAD_km', DoubleType(), True),
+    StructField('total_sum_distance_HIGHWAY_km', DoubleType(), True),
+    StructField('H2D_duree_MEL_mode_1_agg', StringType(), True),
+    StructField('H2D_duree_MEL_mode_2_agg', StringType(), True),
+    StructField('H2D_duree_MEL_mode_3_agg', StringType(), True),
+    StructField('H2D_duree_MEL_mode_4_agg', StringType(), True),
+    StructField('H2D_duree_MEL_mode_5_agg', StringType(), True),
+    StructField('H2D_duree_MEL_mode_6_agg', StringType(), True),
+    StructField('H2D_duree_MEL_mode_7_agg', StringType(), True),
+])
+BS_total_duration_H2D_matrix_rpm_torque_BS =StructType([
+    StructField('DRIVER_ID', StringType(), True),
+    StructField('month', IntegerType(), True),
+    StructField('year', IntegerType(), True),
+    StructField('num_trips', IntegerType(), True),
+    StructField('BS_total_duration_H2D_matrix_rpm_torque_BS', StringType(), True)
+])
+#------------------------------------------------------------------------------------------------------------
+
+##########################################
+
+# Schemas ----------------------------------
+ICE_starts_per_trip_schema = StructType([
+    StructField("DRIVER_ID", StringType(), True),
+    StructField("TRIP_ID", DoubleType(), True),
+    StructField("nbr_demarrage_mth_veh_roulant", DoubleType(), True),
+    StructField("nbr_demarrage_mth_veh_arrete", DoubleType(), True),
+])
+ICE_duration_veh_roulant_per_gear_trips_schema = StructType([
+    StructField("DRIVER_ID", StringType(), True),
+    StructField("TRIP_ID", DoubleType(), True),
+    StructField("mode", StringType(), True),
+    StructField("h2d_duree_ICE_duration_veh_roulant_per_gear_trips_matrix_json", StringType(), True)
+])
+
+BS_h2d_schema = StructType([
+    StructField('DRIVER_ID', StringType(), True),
+    StructField('TRIP_ID', DoubleType(), True),
+    StructField('h2d_matrix_json', StringType(), True)
+])
