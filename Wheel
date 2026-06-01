@@ -1,0 +1,215 @@
+from statistics import mean
+from scipy import integrate
+def GetDistanceFromSpeed_m(p_timeStamp,p_Speed):
+    #p_Speed = Km/h  && p_timeStamp unit = s une conversion est faite à l'interieur
+    time = np.array(p_timeStamp)
+    speed = np.array(p_Speed)*1000/3600
+    distance_cumul_m = integrate.cumtrapz(speed, time, initial=0)
+    return distance_cumul_m
+
+
+def H2DDISTANCE(p_Time,p_Speed,p_signalX,p_signalY,p_BinsX,p_UnitX,p_BinsY,p_UnitY,p_roulage):
+    distance=np.append(np.diff(GetDistanceFromSpeed_m(p_Time,p_Speed)),0)
+    np_signalX=np.array(p_signalX,dtype = float)
+    np_signalY=np.array(p_signalY,dtype = float)    
+    ClassesX=["roulage"]+[""]+["["+str(p_BinsX[0])+p_UnitX+":"+str(p_BinsX[1])+p_UnitX+"]"]+["]"+str(p_BinsX[i])+p_UnitX+":"+str(p_BinsX[i+1])+p_UnitX+"]" for i in range(1,len(p_BinsX)-1)]
+    ClassesY=["["+str(p_BinsY[0])+p_UnitY+":"+str(p_BinsY[1])+p_UnitY+"]"]+["]"+str(p_BinsY[i])+p_UnitY+":"+str(p_BinsY[i+1])+p_UnitY+"]" for i in range(1,len(p_BinsY)-1)]
+    H2D=[]
+    H2D.append(ClassesX)
+    for j in range(len(p_BinsY)-1):
+        hist=[]
+        hist.append(p_roulage)
+        hist.append(ClassesY[j])
+        for i in range(len(p_BinsX)-1):            
+            dist_i=sum(distance[((np_signalX>p_BinsX[i]) & (np_signalX<=p_BinsX[i+1]) & (np_signalY>p_BinsY[j]) & (np_signalY<=p_BinsY[j+1]))])
+            hist.append(dist_i)
+        H2D.append(hist)
+    return H2D
+
+
+def H2D_distance_roue_roue(pdf):
+        driver_id = str(pdf['DRIVER_ID'].iloc[0])
+        trip_id = pdf['TRIP_ID'].iloc[0]
+
+        p_BinsX = [x for x in range(-100, 7950, 50)]   #ROUE RPM 
+        p_BinsY = [y for y in range(-1200, 2000, 5)]   # ROUE Torque
+
+        x_min = min(p_BinsX)
+        x_max = max(p_BinsX)
+        x_step = np.mean(np.diff(p_BinsX))
+        y_min = min(p_BinsY)
+        y_max = max(p_BinsY)
+        y_step = np.mean(np.diff(p_BinsY))
+        p_UnitX = "RPM"
+        p_UnitY = "N.m"
+
+        p_roulage = f"{driver_id}_{str(trip_id)}"
+
+        required_cols = ['TIMESTAMP', 'VEHICLE_SPEED', 'REGIME_ROUE', 'COUPLE_ROUE']
+        pdf = pdf.dropna(subset=required_cols)
+        # Debug: check how many rows survive each filter
+        initial_count = len(pdf)
+        pdf = pdf.dropna(subset=required_cols)
+        after_dropna = len(pdf)
+        
+        engine_on_threshold = 50
+        pdf_filtered = pdf[pdf['REGIME_ROUE'] >= engine_on_threshold].copy()
+        after_threshold = len(pdf_filtered)
+        
+        print(f"Trip {driver_id}_{trip_id}: initial={initial_count}, after_dropna={after_dropna}, after_threshold={after_threshold}")
+
+        engine_on_threshold = 0  # RPM
+        pdf_filtered = pdf[pdf['REGIME_ROUE'] >= engine_on_threshold].copy()
+        pdf_filtered = pdf_filtered.sort_values('TIMESTAMP').reset_index(drop=True)
+
+        if len(pdf_filtered) < 2:
+            return pd.DataFrame([{
+                'DRIVER_ID': driver_id,
+                'TRIP_ID': float(trip_id),
+                'h2d_roue_distance_json': None
+            }])
+
+        pdf_filtered['TIMESTAMP_numeric'] = (
+            pdf_filtered['TIMESTAMP'] - pdf_filtered['TIMESTAMP'].iloc[0]
+        ).dt.total_seconds()
+
+        matrix_data = H2DDISTANCE(
+            pdf_filtered['TIMESTAMP_numeric'],    # Time (numeric seconds)
+            pdf_filtered['VEHICLE_SPEED'],     # Speed (for distance computation)
+            pdf_filtered['REGIME_ROUE'],       # Signal X: wheel RPM
+            pdf_filtered['COUPLE_ROUE'],           # Signal Y: wheel torque
+            p_BinsX,
+            p_UnitX,
+            p_BinsY,
+            p_UnitY,
+            p_roulage
+        )
+
+        if matrix_data is None or len(matrix_data) < 2:
+            return pd.DataFrame([{
+                'DRIVER_ID': driver_id,
+                'TRIP_ID': float(trip_id),
+                'h2d_roue_distance_json': None
+            }])
+
+        rpm_bins = matrix_data[0][2:]
+        torque_bins = [row[1] for row in matrix_data[1:]]
+        values = [row[2:] for row in matrix_data[1:]]
+
+        matrix_nested = {}
+
+        for i, torque_bin in enumerate(torque_bins):
+            torque_key = str(torque_bin)
+            matrix_nested[torque_key] = {}
+
+            for j, rpm_bin in enumerate(rpm_bins):
+                rpm_key = str(rpm_bin)
+                value = float(values[i][j]) if values[i][j] is not None else 0.0
+                matrix_nested[torque_key][rpm_key] = {"none": value}
+
+        h2d_json_obj = {
+            "x_axis": "REGIME_ROUE",
+            "y_axis": "COUPLE_ROUE",
+            "x_bins": f"min={x_min};max={x_max};step={x_step}",
+            "y_bins": f"min={y_min};max={y_max};step={y_step}",
+            "matrix": matrix_nested
+        }
+
+        h2d_json = json.dumps(h2d_json_obj)
+
+        return pd.DataFrame([{
+            'DRIVER_ID': driver_id,
+            'TRIP_ID': float(trip_id),
+            'h2d_roue_distance_json': h2d_json
+        }])
+
+roue_h2d_schema = StructType([
+    StructField('DRIVER_ID', StringType(), True),
+    StructField('TRIP_ID', DoubleType(), True),
+    StructField('h2d_roue_distance_json', StringType(), True)
+])
+
+##################################################################################################"
+###DRIVER LEVEL
+##################################################################################################
+
+def aggregate_roue_h2d_matrix_to_driver_level(pdf: pd.DataFrame) -> pd.DataFrame:
+    driver_id = pdf['DRIVER_ID'].iloc[0]
+    
+    month_mode = pdf['month'].mode()
+    year_mode = pdf['year'].mode()
+    
+    month = int(month_mode.iloc[0]) if len(month_mode) > 0 and pd.notna(month_mode.iloc[0]) else None
+    year = int(year_mode.iloc[0]) if len(year_mode) > 0 and pd.notna(year_mode.iloc[0]) else None
+    num_trips = int(len(pdf))
+    
+
+    aggregated_matrix = {}
+    metadata = None
+    
+
+    for json_str in pdf['h2d_roue_distance_json'].dropna():
+        try:
+            data = json.loads(json_str)
+            
+            # Extract metadata (same across all trips, take first valid one)
+            if metadata is None:
+                metadata = {
+                    'x_axis': data.get('x_axis', ''),
+                    'y_axis': data.get('y_axis', ''),
+                    'x_bins': data.get('x_bins', ''),
+                    'y_bins': data.get('y_bins', '')
+                }
+            
+            # Sum matrix values: navigate nested structure torque_bin -> rpm_bin -> {"none": value}
+            trip_matrix = data.get('matrix', {})
+            
+            for torque_bin, rpm_dict in trip_matrix.items():
+                if torque_bin not in aggregated_matrix:
+                    aggregated_matrix[torque_bin] = {}
+                
+                for rpm_bin, z_dict in rpm_dict.items():
+                    # Extract value from {"none": value} structure
+                    value = float(z_dict.get('none', 0.0))
+                    
+                    if rpm_bin in aggregated_matrix[torque_bin]:
+                        # Sum with existing value
+                        aggregated_matrix[torque_bin][rpm_bin]['none'] += value
+                    else:
+                        # Initialize new bin
+                        aggregated_matrix[torque_bin][rpm_bin] = {'none': value}
+                        
+        except (json.JSONDecodeError, TypeError, KeyError, AttributeError) as e:
+            # Skip invalid JSON or malformed data
+            print(f"Warning: Skipping invalid wheel matrix for {driver_id}: {e}")
+            continue
+    
+    # Build result JSON string
+    if aggregated_matrix and metadata:
+        result_json = {
+            **metadata,
+            'matrix': aggregated_matrix
+        }
+        aggregated_json_str = json.dumps(result_json)
+    else:
+        aggregated_json_str = None
+    
+    # Return single-row DataFrame
+    return pd.DataFrame([{
+        'DRIVER_ID': driver_id,
+        'month': month,
+        'year': year,
+        'num_trips': num_trips,
+        'roue_total_distance_H2D_matrix_rpm_torque': aggregated_json_str
+    }])
+
+
+roue_h2d_driver_schema = StructType([
+    StructField('DRIVER_ID', StringType(), True),
+    StructField('month', IntegerType(), True),
+    StructField('year', IntegerType(), True),
+    StructField('num_trips', IntegerType(), True),
+    StructField('roue_total_distance_H2D_matrix_rpm_torque', StringType(), True)
+])
+
+
