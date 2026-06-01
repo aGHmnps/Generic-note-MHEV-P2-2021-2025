@@ -1,0 +1,214 @@
+#######################"
+#trips level function
+def RIPPLE_overload_duration_ratio_trips(pdf):
+
+    import numpy as np
+    import pandas as pd
+    
+    # ── Thresholds ──
+    TORQUE_ABS_HIGH = 105.0    # N.m – overload regardless of RPM
+    TORQUE_ABS_LOW  = 45.0     # N.m – overload only if RPM > threshold
+    RPM_THRESHOLD   = 1500.0   # rpm
+    
+    # ── Column mapping (adapt to your actual column names) ──
+    time_col      = 'TIMESTAMP'
+    torque_col    = 'Torque_MEL'
+    rpm_col       = 'RPM_MEL'         
+    vin_col       = 'VIN'
+    driver_id_col = 'DRIVER_ID'
+    trip_id_col   = 'TRIP_ID'
+    
+    # ── Empty result template ──
+    empty_result = pd.DataFrame({
+        'TRIP_ID':                pd.Series(dtype='object'),
+        'DRIVER_ID':              pd.Series(dtype='object'),
+        'overload_duration_s':    pd.Series(dtype='float64'),
+        'total_duration_s':       pd.Series(dtype='float64'),
+        'overload_ratio_pct':     pd.Series(dtype='float64'),
+        'nb_samples_overload':    pd.Series(dtype='int64'),
+        'nb_samples_total':       pd.Series(dtype='int64'),
+        'sample_rate_hz':         pd.Series(dtype='float64'),
+        'max_abs_torque_nm':      pd.Series(dtype='float64'),
+        'max_rpm':                pd.Series(dtype='float64')
+    })
+    
+    # ── Validate required columns ──
+    # required_cols = [time_col, torque_col, rpm_col, vin_col, trip_id_col, driver_id_col]
+    # if not all(col in pdf.columns for col in required_cols):
+    #     return empty_result
+    
+    # ── Sort & clean ──
+    pdf = pdf.sort_values(time_col).reset_index(drop=True)
+    pdf = pdf.dropna(subset=[time_col, torque_col, rpm_col])
+    
+    if len(pdf) < 2:
+        return pd.DataFrame([{
+            'TRIP_ID':             pdf[trip_id_col].iloc[0] if len(pdf) > 0 else None,
+            'DRIVER_ID':           pdf[driver_id_col].iloc[0] if len(pdf) > 0 else None,
+            'overload_duration_s': 0.0,
+            'total_duration_s':    0.0,
+            'overload_ratio_pct':  0.0,
+            'nb_samples_overload': 0,
+            'nb_samples_total':    0,
+            'sample_rate_hz':      0.0,
+            'max_abs_torque_nm':   0.0,
+            'max_rpm':             0.0
+        }])
+    
+    # ── Get identifiers ──
+    trip_id   = int(float(pdf[trip_id_col].iloc[0]))
+    driver_id = str(pdf[driver_id_col].iloc[0])
+    
+    # ── Extract signals ──
+    times      = pdf[time_col].values.astype(float)
+    torque     = pdf[torque_col].values.astype(float)
+    rpm        = pdf[rpm_col].values.astype(float)
+    abs_torque = np.abs(torque)
+    
+    # ── Compute overload boolean mask ──
+    # Condition A: |torque| > 105 N.m (any RPM)
+    cond_A = abs_torque > TORQUE_ABS_HIGH
+    
+    # Condition B: |torque| > 45 N.m AND RPM > 1500
+    cond_B = (abs_torque > TORQUE_ABS_LOW) & (rpm > RPM_THRESHOLD)
+    
+    # Combined
+    overload_mask = cond_A | cond_B
+    
+    # ── Compute durations ──
+    # Use median sample period for robustness (same as your GW method)
+    time_deltas   = np.diff(times)
+    sample_period = float(np.median(time_deltas))
+    sample_rate_hz = 1.0 / sample_period if sample_period > 0 else 0.0
+    
+    # Total duration: (N-1) * sample_period (GlyphWorks convention)
+    total_duration_s = (len(times) - 1) * sample_period
+    
+    # Overload duration: number of overload samples * sample_period
+    # Note: we use sum of mask (each True sample = 1 sample_period of overload)
+    nb_samples_overload = int(overload_mask.sum())
+    nb_samples_total    = len(times)
+    overload_duration_s = nb_samples_overload * sample_period
+    
+    # ── Ratio ──
+    if total_duration_s > 0:
+        overload_ratio_pct = (overload_duration_s / total_duration_s) * 100.0
+    else:
+        overload_ratio_pct = 0.0
+    
+    # ── Statistics ──
+    max_abs_torque_nm = float(np.max(abs_torque))
+    max_rpm           = float(np.max(rpm))
+    
+    
+    return pd.DataFrame([{
+        'TRIP_ID':             trip_id,
+        'DRIVER_ID':           driver_id,
+        'overload_duration_s': overload_duration_s,
+        'total_duration_s':    total_duration_s,
+        'overload_ratio_pct':  overload_ratio_pct,
+        'nb_samples_overload': nb_samples_overload,
+        'nb_samples_total':    nb_samples_total,
+        'sample_rate_hz':      sample_rate_hz,
+        'max_abs_torque_nm':   max_abs_torque_nm,
+        'max_rpm':             max_rpm
+    }])
+
+
+from pyspark.sql.types import StructType, StructField, StringType, DoubleType, IntegerType
+
+RIPPLE_overload_duration_ratio_trips_schema = StructType([
+    StructField("TRIP_ID",             DoubleType(),  True),
+    StructField("DRIVER_ID",           StringType(),  True),
+    StructField("overload_duration_s", DoubleType(),  True),
+    StructField("total_duration_s",    DoubleType(),  True),
+    StructField("overload_ratio_pct",  DoubleType(),  True),
+    StructField("nb_samples_overload", IntegerType(), True),
+    StructField("nb_samples_total",    IntegerType(), True),
+    StructField("sample_rate_hz",      DoubleType(),  True),
+    StructField("max_abs_torque_nm",   DoubleType(),  True),
+    StructField("max_rpm",             DoubleType(),  True),
+])
+
+
+###DRIVER level functions
+def RIPPLE_overload_duration_ratio_drivers(pdf):
+
+    import numpy as np
+    import pandas as pd
+    
+    driver_id_col = 'DRIVER_ID'
+    
+    if len(pdf) == 0:
+        return pd.DataFrame({
+            'DRIVER_ID':              pd.Series(dtype='object'),
+            'month':                  pd.Series(dtype='int64'),
+            'year':                   pd.Series(dtype='int64'),
+            'nb_trips':               pd.Series(dtype='int64'),
+            'overload_duration_s':    pd.Series(dtype='float64'),
+            'total_duration_s':       pd.Series(dtype='float64'),
+            'overload_ratio_pct':     pd.Series(dtype='float64'),
+            'nb_samples_overload':    pd.Series(dtype='int64'),
+            'nb_samples_total':       pd.Series(dtype='int64'),
+            'avg_sample_rate_hz':     pd.Series(dtype='float64'),
+            'max_abs_torque_nm':      pd.Series(dtype='float64'),
+            'max_rpm':                pd.Series(dtype='float64'),
+        })
+    
+    driver_id = str(pdf[driver_id_col].iloc[0])
+    
+    month_val = int(pdf["month"].iloc[0]) if "month" in pdf.columns else 0
+    year_val  = int(pdf["year"].iloc[0])  if "year"  in pdf.columns else 0
+
+    total_overload_s    = float(pdf['overload_duration_s'].sum())
+    total_duration_s    = float(pdf['total_duration_s'].sum())
+    nb_samples_overload = int(pdf['nb_samples_overload'].sum())
+    nb_samples_total    = int(pdf['nb_samples_total'].sum())
+    nb_trips            = len(pdf)
+
+    if total_duration_s > 0:
+        overload_ratio_pct = (total_overload_s / total_duration_s) * 100.0
+    else:
+        overload_ratio_pct = 0.0
+
+    max_abs_torque_nm = float(pdf['max_abs_torque_nm'].max())
+    max_rpm           = float(pdf['max_rpm'].max())
+    
+    avg_sample_rate_hz = float(pdf['sample_rate_hz'].mean())
+    
+    return pd.DataFrame([{
+        'DRIVER_ID':           driver_id,
+        'month':               month_val,
+        'year':                year_val,
+        'nb_trips':            nb_trips,
+        'overload_duration_s': total_overload_s,
+        'total_duration_s':    total_duration_s,
+        'overload_ratio_pct':  overload_ratio_pct,
+        'nb_samples_overload': nb_samples_overload,
+        'nb_samples_total':    nb_samples_total,
+        'avg_sample_rate_hz':  avg_sample_rate_hz,
+        'max_abs_torque_nm':   max_abs_torque_nm,
+        'max_rpm':             max_rpm,
+    }])
+
+
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DoubleType
+
+# =================================================================================================
+# 2) OUTPUT SCHEMA DEFINITION
+# =================================================================================================
+# Schema for VIN-level results
+RIPPLE_overload_duration_ratio_drivers_schema = StructType([
+    StructField("DRIVER_ID",           StringType(),  True),
+    StructField("month",               IntegerType(), True),
+    StructField("year",                IntegerType(), True),
+    StructField("nb_trips",            IntegerType(), True),
+    StructField("overload_duration_s", DoubleType(),  True),
+    StructField("total_duration_s",    DoubleType(),  True),
+    StructField("overload_ratio_pct",  DoubleType(),  True),
+    StructField("nb_samples_overload", IntegerType(), True),
+    StructField("nb_samples_total",    IntegerType(), True),
+    StructField("avg_sample_rate_hz",  DoubleType(),  True),
+    StructField("max_abs_torque_nm",   DoubleType(),  True),
+    StructField("max_rpm",             DoubleType(),  True),
+])
