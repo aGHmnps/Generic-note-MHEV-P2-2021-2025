@@ -1,3 +1,488 @@
+
+###########H1D ICE TRIPS
+
+import numpy as np
+import pandas as pd
+from statistics import mean
+import json
+
+def GetStartEndSection(a):
+    a = np.asarray(a, dtype=np.int8)
+    iszero = np.concatenate(([1], np.equal(a, 0).view(np.int8), [1]))
+    absdiff = np.abs(np.diff(iszero))
+    ranges = np.where(absdiff == 1)[0].reshape(-1, 2)
+    ranges = [[x[0], x[1] - 1] for x in ranges]
+    return ranges
+
+def GetPhaseDurations(p_time, p_condition_mask):
+    time = np.array(p_time, dtype=float)
+    mask = np.array(p_condition_mask, dtype=int)
+    sections = GetStartEndSection(mask)
+    
+    durations = []
+    for start_idx, end_idx in sections:
+        duration = time[end_idx] - time[start_idx]
+        durations.append(duration)
+    
+    return durations, sections
+
+def H1D_EVENT_COUNT(p_durations, p_Bins, p_Unit, p_roulage):
+    Classes = (
+        ["Roulage"] +
+        ["[" + str(p_Bins[0]) + p_Unit + ":" + str(p_Bins[1]) + p_Unit + "]"] +
+        ["]" + str(p_Bins[i]) + p_Unit + ":" + str(p_Bins[i + 1]) + p_Unit + "]"
+         for i in range(1, len(p_Bins) - 1)]
+    )
+    
+    np_durations = np.array(p_durations, dtype=float)
+    
+    occ = [p_roulage]
+    
+    # First bin: [Bins[0] : Bins[1]]
+    count_i = int(np.sum((np_durations >= p_Bins[0]) & (np_durations <= p_Bins[1])))
+    occ.append(count_i)
+    
+    # Remaining bins: ]Bins[i] : Bins[i+1]]
+    for i in range(1, len(p_Bins) - 1):
+        count_i = int(np.sum((np_durations > p_Bins[i]) & (np_durations <= p_Bins[i + 1])))
+        occ.append(count_i)
+    
+    return pd.DataFrame([occ], columns=Classes)
+
+def detect_engine_off_phases(p_time, p_engine_rpm, p_vehicle_speed, 
+                              engine_off_threshold=50, 
+                              vehicle_stopped_threshold=1.0,
+                              vehicle_context="stopped"):
+
+    time = np.array(p_time, dtype=float)
+    rpm = np.array(p_engine_rpm, dtype=float)
+    speed = np.array(p_vehicle_speed, dtype=float)
+    
+    # Identify engine OFF mask
+    engine_off_mask = (rpm < engine_off_threshold).astype(int)
+    
+    # Get all engine OFF sections
+    sections = GetStartEndSection(engine_off_mask)
+    
+    durations = []
+    
+    for start_idx, end_idx in sections:
+        # Check that this OFF phase is BETWEEN two ON phases
+        # i.e., there's engine ON before start and after end
+        has_on_before = (start_idx > 0) and (rpm[start_idx - 1] >= engine_off_threshold)
+        has_on_after = (end_idx < len(rpm) - 1) and (rpm[end_idx + 1] >= engine_off_threshold)
+        
+        if not (has_on_before and has_on_after):
+            continue
+        
+        # Check vehicle state during the OFF phase
+        phase_speed = speed[start_idx:end_idx + 1]
+        
+        if vehicle_context == "stopped":
+            # Vehicle must be stopped during the entire OFF phase
+            if np.all(phase_speed < vehicle_stopped_threshold):
+                duration = time[end_idx] - time[start_idx]
+                durations.append(duration)
+                
+        elif vehicle_context == "running":
+            # Vehicle must be running during the entire OFF phase
+            if np.all(phase_speed >= vehicle_stopped_threshold):
+                duration = time[end_idx] - time[start_idx]
+                durations.append(duration)
+                
+        elif vehicle_context == "transition":
+            # Vehicle is in transition: mix of running and stopped
+            has_stopped = np.any(phase_speed < vehicle_stopped_threshold)
+            has_running = np.any(phase_speed >= vehicle_stopped_threshold)
+            if has_stopped and has_running:
+                duration = time[end_idx] - time[start_idx]
+                durations.append(duration)
+    
+    return durations
+
+def detect_engine_restart_events(p_time, p_engine_rpm, p_vehicle_speed,
+                                  engine_off_threshold=50,
+                                  vehicle_stopped_threshold=1.0,
+                                  vehicle_context="stopped"):
+
+    time = np.array(p_time, dtype=float)
+    rpm = np.array(p_engine_rpm, dtype=float)
+    speed = np.array(p_vehicle_speed, dtype=float)
+    
+    # Identify engine OFF mask
+    engine_off_mask = (rpm < engine_off_threshold).astype(int)
+    
+    # Get all engine OFF sections
+    sections = GetStartEndSection(engine_off_mask)
+    
+    durations = []
+    
+    for start_idx, end_idx in sections:
+        # restart at end_idx + 1 (transition from OFF to ON)
+        restart_idx = end_idx + 1
+        
+        if restart_idx >= len(rpm):
+            continue
+        
+        # Verify restart (engine goes ON after)
+        if rpm[restart_idx] < engine_off_threshold:
+            continue
+        
+        # Check vehicle state at restart 
+        vehicle_speed_at_restart = speed[restart_idx]
+        
+        if vehicle_context == "stopped" and vehicle_speed_at_restart >= vehicle_stopped_threshold:
+            continue
+        elif vehicle_context == "running" and vehicle_speed_at_restart < vehicle_stopped_threshold:
+            continue
+        
+        # Duration of the OFF phase that preceded this restart
+        duration = time[end_idx] - time[start_idx]
+        durations.append(duration)
+    
+    return durations
+
+def H1D_engine_off_between_on_vehicle_stopped(pdf):
+    driver_id = str(pdf['DRIVER_ID'].iloc[0])
+    trip_id = pdf['TRIP_ID'].iloc[0]
+    p_roulage = f"{driver_id}_{str(trip_id)}"
+    
+    # Duration bins in seconds
+    p_Bins = [0, 2, 5, 10, 20, 30, 60, 120, 300, 600, 1200, 1800, 3600]
+    p_Unit = "s"
+    
+    required_cols = ['TIMESTAMP', 'REGIME_MOTEUR', 'VEHICLE_SPEED']
+    pdf = pdf.dropna(subset=required_cols)
+    pdf = pdf.sort_values('TIMESTAMP').reset_index(drop=True)
+    
+    if len(pdf) < 2:
+        return pd.DataFrame([{
+            'DRIVER_ID': driver_id,
+            'TRIP_ID': float(trip_id),
+            'h1d_engine_off_stopped_json': None
+        }])
+    
+    pdf['TIMESTAMP_numeric'] = (
+        pdf['TIMESTAMP'] - pdf['TIMESTAMP'].iloc[0]
+    ).dt.total_seconds()
+    
+    # Detect engine OFF phases between ON phases, vehicle stopped
+    durations = detect_engine_off_phases(
+        p_time=pdf['TIMESTAMP_numeric'].values,
+        p_engine_rpm=pdf['REGIME_MOTEUR'].values,
+        p_vehicle_speed=pdf['VEHICLE_SPEED'].values,
+        vehicle_context="stopped"
+    )
+    
+    # Build histogram
+    result_df = H1D_EVENT_COUNT(durations, p_Bins, p_Unit, p_roulage)
+    
+    # Build JSON output
+    bin_labels = list(result_df.columns[1:])
+    bin_values = [int(v) for v in result_df.iloc[0, 1:].values]
+    
+    x_min = min(p_Bins)
+    x_max = max(p_Bins)
+    x_step = "variable"
+    
+    h1d_json_obj = {
+        "x_axis": "DURATION_ENGINE_OFF_VEHICLE_STOPPED",
+        "x_bins": f"edges={p_Bins}",
+        "x_unit": p_Unit,
+        "total_events": int(len(durations)),
+        "histogram": dict(zip(bin_labels, bin_values))
+    }
+    
+    h1d_json = json.dumps(h1d_json_obj)
+    
+    return pd.DataFrame([{
+        'DRIVER_ID': driver_id,
+        'TRIP_ID': float(trip_id),
+        'h1d_engine_off_stopped_json': h1d_json
+    }])
+
+def H1D_engine_off_between_on_vehicle_running(pdf):
+    driver_id = str(pdf['DRIVER_ID'].iloc[0])
+    trip_id = pdf['TRIP_ID'].iloc[0]
+    p_roulage = f"{driver_id}_{str(trip_id)}"
+    
+    p_Bins = [0, 2, 5, 10, 20, 30, 60, 120, 300, 600, 1200, 1800, 3600]
+    p_Unit = "s"
+    
+    required_cols = ['TIMESTAMP', 'REGIME_MOTEUR', 'VEHICLE_SPEED']
+    pdf = pdf.dropna(subset=required_cols)
+    pdf = pdf.sort_values('TIMESTAMP').reset_index(drop=True)
+    
+    if len(pdf) < 2:
+        return pd.DataFrame([{
+            'DRIVER_ID': driver_id,
+            'TRIP_ID': float(trip_id),
+            'h1d_engine_off_running_json': None
+        }])
+    
+    pdf['TIMESTAMP_numeric'] = (
+        pdf['TIMESTAMP'] - pdf['TIMESTAMP'].iloc[0]
+    ).dt.total_seconds()
+    
+    durations = detect_engine_off_phases(
+        p_time=pdf['TIMESTAMP_numeric'].values,
+        p_engine_rpm=pdf['REGIME_MOTEUR'].values,
+        p_vehicle_speed=pdf['VEHICLE_SPEED'].values,
+        vehicle_context="running"
+    )
+    
+    result_df = H1D_EVENT_COUNT(durations, p_Bins, p_Unit, p_roulage)
+    
+    bin_labels = list(result_df.columns[1:])
+    bin_values = [int(v) for v in result_df.iloc[0, 1:].values]
+    
+    h1d_json_obj = {
+        "x_axis": "DURATION_ENGINE_OFF_VEHICLE_RUNNING",
+        "x_bins": f"edges={p_Bins}",
+        "x_unit": p_Unit,
+        "total_events": int(len(durations)),
+        "histogram": dict(zip(bin_labels, bin_values))
+    }
+    
+    return pd.DataFrame([{
+        'DRIVER_ID': driver_id,
+        'TRIP_ID': float(trip_id),
+        'h1d_engine_off_running_json': json.dumps(h1d_json_obj)
+    }])
+
+def H1D_engine_off_between_on_vehicle_transition(pdf):
+    driver_id = str(pdf['DRIVER_ID'].iloc[0])
+    trip_id = pdf['TRIP_ID'].iloc[0]
+    p_roulage = f"{driver_id}_{str(trip_id)}"
+    
+    p_Bins = [0, 2, 5, 10, 20, 30, 60, 120, 300, 600, 1200, 1800, 3600]
+    p_Unit = "s"
+    
+    required_cols = ['TIMESTAMP', 'REGIME_MOTEUR', 'VEHICLE_SPEED']
+    pdf = pdf.dropna(subset=required_cols)
+    pdf = pdf.sort_values('TIMESTAMP').reset_index(drop=True)
+    
+    if len(pdf) < 2:
+        return pd.DataFrame([{
+            'DRIVER_ID': driver_id,
+            'TRIP_ID': float(trip_id),
+            'h1d_engine_off_transition_json': None
+        }])
+    
+    pdf['TIMESTAMP_numeric'] = (
+        pdf['TIMESTAMP'] - pdf['TIMESTAMP'].iloc[0]
+    ).dt.total_seconds()
+    
+    durations = detect_engine_off_phases(
+        p_time=pdf['TIMESTAMP_numeric'].values,
+        p_engine_rpm=pdf['REGIME_MOTEUR'].values,
+        p_vehicle_speed=pdf['VEHICLE_SPEED'].values,
+        vehicle_context="transition"
+    )
+    
+    result_df = H1D_EVENT_COUNT(durations, p_Bins, p_Unit, p_roulage)
+    
+    bin_labels = list(result_df.columns[1:])
+    bin_values = [int(v) for v in result_df.iloc[0, 1:].values]
+    
+    h1d_json_obj = {
+        "x_axis": "DURATION_ENGINE_OFF_VEHICLE_TRANSITION",
+        "x_bins": f"edges={p_Bins}",
+        "x_unit": p_Unit,
+        "total_events": int(len(durations)),
+        "histogram": dict(zip(bin_labels, bin_values))
+    }
+    
+    return pd.DataFrame([{
+        'DRIVER_ID': driver_id,
+        'TRIP_ID': float(trip_id),
+        'h1d_engine_off_transition_json': json.dumps(h1d_json_obj)
+    }])
+
+def H1D_engine_restart_vehicle_stopped(pdf):
+    driver_id = str(pdf['DRIVER_ID'].iloc[0])
+    trip_id = pdf['TRIP_ID'].iloc[0]
+    p_roulage = f"{driver_id}_{str(trip_id)}"
+    
+    p_Bins = [0, 2, 5, 10, 20, 30, 60, 120, 300, 600, 1200, 1800, 3600]
+    p_Unit = "s"
+    
+    required_cols = ['TIMESTAMP', 'REGIME_MOTEUR', 'VEHICLE_SPEED']
+    pdf = pdf.dropna(subset=required_cols)
+    pdf = pdf.sort_values('TIMESTAMP').reset_index(drop=True)
+    
+    if len(pdf) < 2:
+        return pd.DataFrame([{
+            'DRIVER_ID': driver_id,
+            'TRIP_ID': float(trip_id),
+            'h1d_restart_stopped_json': None
+        }])
+    
+    pdf['TIMESTAMP_numeric'] = (
+        pdf['TIMESTAMP'] - pdf['TIMESTAMP'].iloc[0]
+    ).dt.total_seconds()
+    
+    # Detect restart events when vehicle is stopped
+    durations = detect_engine_restart_events(
+        p_time=pdf['TIMESTAMP_numeric'].values,
+        p_engine_rpm=pdf['REGIME_MOTEUR'].values,
+        p_vehicle_speed=pdf['VEHICLE_SPEED'].values,
+        vehicle_context="stopped"
+    )
+    
+    result_df = H1D_EVENT_COUNT(durations, p_Bins, p_Unit, p_roulage)
+    
+    bin_labels = list(result_df.columns[1:])
+    bin_values = [int(v) for v in result_df.iloc[0, 1:].values]
+    
+    h1d_json_obj = {
+        "x_axis": "DURATION_OFF_BEFORE_RESTART_VEHICLE_STOPPED",
+        "x_bins": f"edges={p_Bins}",
+        "x_unit": p_Unit,
+        "total_events": int(len(durations)),
+        "  histogram": dict(zip(bin_labels, bin_values))
+    }
+
+    return pd.DataFrame([{
+        'DRIVER_ID': driver_id,
+        'TRIP_ID': float(trip_id),
+        'h1d_restart_stopped_json': json.dumps(h1d_json_obj)
+    }])
+        
+def H1D_engine_restart_vehicle_running(pdf):
+    driver_id = str(pdf['DRIVER_ID'].iloc[0])
+    trip_id = pdf['TRIP_ID'].iloc[0]
+    p_roulage = f"{driver_id}_{str(trip_id)}"
+    
+    p_Bins = [0, 2, 5, 10, 20, 30, 60, 120, 300, 600, 1200, 1800, 3600]
+    p_Unit = "s"
+    
+    required_cols = ['TIMESTAMP', 'ENGINE_RPM', 'VEHICLE_SPEED']
+    pdf = pdf.dropna(subset=required_cols)
+    pdf = pdf.sort_values('TIMESTAMP').reset_index(drop=True)
+    
+    if len(pdf) < 2:
+        return pd.DataFrame([{
+            'DRIVER_ID': driver_id,
+            'TRIP_ID': float(trip_id),
+            'h1d_restart_running_json': None
+        }])
+    
+    pdf['TIMESTAMP_numeric'] = (
+        pdf['TIMESTAMP'] - pdf['TIMESTAMP'].iloc[0]
+    ).dt.total_seconds()
+    
+    # Detect restart events when vehicle is running
+    durations = detect_engine_restart_events(
+        p_time=pdf['TIMESTAMP_numeric'].values,
+        p_engine_rpm=pdf['REGIME_MOTEUR'].values,
+        p_vehicle_speed=pdf['VEHICLE_SPEED'].values,
+        vehicle_context="running"
+    )
+    
+    result_df = H1D_EVENT_COUNT(durations, p_Bins, p_Unit, p_roulage)
+    
+    bin_labels = list(result_df.columns[1:])
+    bin_values = [int(v) for v in result_df.iloc[0, 1:].values]
+    
+    h1d_json_obj = {
+        "x_axis": "DURATION_OFF_BEFORE_RESTART_VEHICLE_RUNNING",
+        "x_bins": f"edges={p_Bins}",
+        "x_unit": p_Unit,
+        "total_events": int(len(durations)),
+        "histogram": dict(zip(bin_labels, bin_values))
+    }
+    
+    return pd.DataFrame([{
+        'DRIVER_ID': driver_id,
+        'TRIP_ID': float(trip_id),
+        'h1d_restart_running_json': json.dumps(h1d_json_obj)
+    }])
+
+def H1D_all_engine_events(pdf):
+    driver_id = str(pdf['DRIVER_ID'].iloc[0])
+    trip_id = pdf['TRIP_ID'].iloc[0]
+    p_roulage = f"{driver_id}_{str(trip_id)}"
+    
+    p_Bins = [0, 2, 5, 10, 20, 30, 60, 120, 300, 600, 1200, 1800, 3600]
+    p_Unit = "s"
+    
+    required_cols = ['TIMESTAMP', 'REGIME_MOTEUR', 'VEHICLE_SPEED']
+    pdf = pdf.dropna(subset=required_cols)
+    pdf = pdf.sort_values('TIMESTAMP').reset_index(drop=True)
+    
+    empty_result = {
+        'DRIVER_ID': driver_id,
+        'TRIP_ID': float(trip_id),
+        'h1d_engine_off_stopped_json': None,
+        'h1d_engine_off_running_json': None,
+        'h1d_engine_off_transition_json': None,
+        'h1d_restart_stopped_json': None,
+        'h1d_restart_running_json': None
+    }
+    
+    if len(pdf) < 2:
+        return pd.DataFrame([empty_result])
+    
+    pdf['TIMESTAMP_numeric'] = ( pdf['TIMESTAMP'] - pdf['TIMESTAMP'].iloc[0]).dt.total_seconds()
+    
+    time_arr = pdf['TIMESTAMP_numeric'].values
+    rpm_arr = pdf['REGIME_MOTEUR'].values
+    speed_arr = pdf['VEHICLE_SPEED'].values
+    
+    def build_json(axis_name, durations):
+        if len(durations) == 0:
+            bin_labels = (
+                ["[" + str(p_Bins[0]) + p_Unit + ":" + str(p_Bins[1]) + p_Unit + "]"] +
+                ["]" + str(p_Bins[i]) + p_Unit + ":" + str(p_Bins[i+1]) + p_Unit + "]"
+                 for i in range(1, len(p_Bins) - 1)]
+            )
+            bin_values = [0] * (len(p_Bins) - 1)
+        else:
+            result_df = H1D_EVENT_COUNT(durations, p_Bins, p_Unit, p_roulage)
+            bin_labels = list(result_df.columns[1:])
+            bin_values = [int(v) for v in result_df.iloc[0, 1:].values]
+        
+        return json.dumps({
+            "x_axis": axis_name,
+            "x_bins": f"edges={p_Bins}",
+            "x_unit": p_Unit,
+            "total_events": int(len(durations)),
+            "histogram": dict(zip(bin_labels, bin_values))
+        })
+    
+    dur_off_stopped = detect_engine_off_phases(time_arr, rpm_arr, speed_arr, vehicle_context="stopped")
+    dur_off_running = detect_engine_off_phases(time_arr, rpm_arr, speed_arr, vehicle_context="running")
+    dur_off_transition = detect_engine_off_phases(time_arr, rpm_arr, speed_arr, vehicle_context="transition")
+    dur_restart_stopped = detect_engine_restart_events(time_arr, rpm_arr, speed_arr, vehicle_context="stopped")
+    dur_restart_running = detect_engine_restart_events(time_arr, rpm_arr, speed_arr, vehicle_context="running")
+    
+    result = {
+        'DRIVER_ID': driver_id,
+        'TRIP_ID': float(trip_id),
+        'h1d_engine_off_stopped_json': build_json("DURATION_ENGINE_OFF_VEHICLE_STOPPED", dur_off_stopped),
+        'h1d_engine_off_running_json': build_json("DURATION_ENGINE_OFF_VEHICLE_RUNNING", dur_off_running),
+        'h1d_engine_off_transition_json': build_json("DURATION_ENGINE_OFF_VEHICLE_TRANSITION", dur_off_transition),
+        'h1d_restart_stopped_json': build_json("DURATION_OFF_BEFORE_RESTART_VEHICLE_STOPPED", dur_restart_stopped),
+        'h1d_restart_running_json': build_json("DURATION_OFF_BEFORE_RESTART_VEHICLE_RUNNING", dur_restart_running)
+    }
+    
+    return pd.DataFrame([result])
+
+h1d_all_engine_events_schema = StructType([
+    StructField('DRIVER_ID', StringType(), True),
+    StructField('TRIP_ID', DoubleType(), True),
+    StructField('h1d_engine_off_stopped_json', StringType(), True),
+    StructField('h1d_engine_off_running_json', StringType(), True),
+    StructField('h1d_engine_off_transition_json', StringType(), True),
+    StructField('h1d_restart_stopped_json', StringType(), True),
+    StructField('h1d_restart_running_json', StringType(), True)
+])
+
+
+
+#############
+
 CONFIG_stops = {
     'engine_stop_threshold': 500,
     'lookback_seconds': 5,
