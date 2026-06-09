@@ -1,3 +1,471 @@
+###################### TRIPS ##########################################
+import pandas as pd
+
+def main_ice_trips_fn(pdf: pd.DataFrame) -> pd.DataFrame:
+    """
+    Master trip-level function. Calls every unit metric on the same trip
+    pandas DataFrame and stitches a single 1-row DataFrame matching
+    `main_ice_trips_schema`.
+
+    Includes:
+        - ICE_stops_per_trip                              (1 col)
+        - ICE_starts_per_trip                             (2 cols)
+        - ICE_duration_veh_roulant_per_gear_trips         (7 JSON cols)
+        - BS_H2D_duree_trips_matrix                       (1 JSON col)
+        - H1D_all_engine_events                           (5 JSON cols)
+        - RIPPLE_overload_duration_ratio_trips            (8 scalar cols)
+    """
+
+    # ---- Empty input safeguard ----
+    if pdf is None or pdf.empty:
+        empty = {f.name: None for f in main_ice_trips_schema.fields}
+        return pd.DataFrame([empty])
+
+    driver_id = str(pdf["DRIVER_ID"].iloc[0]) if "DRIVER_ID" in pdf.columns else ""
+    trip_id = float(pdf["TRIP_ID"].iloc[0]) if "TRIP_ID" in pdf.columns else 0.0
+
+    # Helper: extract a column from a unit-function result safely
+    def _get(df, col, default=None):
+        try:
+            if df is None or df.empty or col not in df.columns:
+                return default
+            return df[col].iloc[0]
+        except Exception:
+            return default
+
+    # ====================================================================
+    # 1) ICE stops  (1 row)
+    # ====================================================================
+    try:
+        stops_df = ICE_stops_per_trip(pdf)
+    except Exception as e:
+        print(f"[main_ice_trips_fn] ICE_stops_per_trip failed for {driver_id}/{trip_id}: {e}")
+        stops_df = pd.DataFrame()
+
+    # ====================================================================
+    # 2) ICE starts (1 row)
+    # ====================================================================
+    try:
+        starts_df = ICE_starts_per_trip(pdf)
+    except Exception as e:
+        print(f"[main_ice_trips_fn] ICE_starts_per_trip failed for {driver_id}/{trip_id}: {e}")
+        starts_df = pd.DataFrame()
+
+    # ====================================================================
+    # 3) H2D ICE duration per gear  (7 rows → 7 columns)
+    # ====================================================================
+    try:
+        h2d_gear_df = ICE_duration_veh_roulant_per_gear_trips(pdf)
+    except Exception as e:
+        print(f"[main_ice_trips_fn] ICE_duration_veh_roulant_per_gear_trips failed for {driver_id}/{trip_id}: {e}")
+        h2d_gear_df = pd.DataFrame(columns=[
+            "DRIVER_ID", "TRIP_ID", "mode",
+            "h2d_duree_ICE_duration_veh_roulant_per_gear_trips_matrix_json"
+        ])
+
+    gear_cols = {f"h2d_duree_ICE_gear_{g}_json": None for g in range(7)}
+    if not h2d_gear_df.empty:
+        for _, row in h2d_gear_df.iterrows():
+            mode = row.get("mode", "")
+            if isinstance(mode, str) and mode.startswith("gear_"):
+                try:
+                    g = int(mode.split("_")[1])
+                    if 0 <= g <= 6:
+                        gear_cols[f"h2d_duree_ICE_gear_{g}_json"] = row[
+                            "h2d_duree_ICE_duration_veh_roulant_per_gear_trips_matrix_json"
+                        ]
+                except (ValueError, IndexError):
+                    continue
+
+    # ====================================================================
+    # 4) BS H2D matrix  (1 row)
+    # ====================================================================
+    try:
+        bs_df = BS_H2D_duree_trips_matrix(pdf)
+        bs_h2d_json = _get(bs_df, "h2d_matrix_json", None)
+    except Exception as e:
+        print(f"[main_ice_trips_fn] BS_H2D_duree_trips_matrix failed for {driver_id}/{trip_id}: {e}")
+        bs_h2d_json = None
+
+    # ====================================================================
+    # 5) H1D engine events (1 row, 5 JSON columns)
+    # ====================================================================
+    try:
+        h1d_df = H1D_all_engine_events(pdf)
+        h1d_off_stopped     = _get(h1d_df, "h1d_engine_off_stopped_json",    None)
+        h1d_off_running     = _get(h1d_df, "h1d_engine_off_running_json",    None)
+        h1d_off_transition  = _get(h1d_df, "h1d_engine_off_transition_json", None)
+        h1d_restart_stopped = _get(h1d_df, "h1d_restart_stopped_json",       None)
+        h1d_restart_running = _get(h1d_df, "h1d_restart_running_json",       None)
+    except Exception as e:
+        print(f"[main_ice_trips_fn] H1D_all_engine_events failed for {driver_id}/{trip_id}: {e}")
+        h1d_off_stopped = h1d_off_running = h1d_off_transition = None
+        h1d_restart_stopped = h1d_restart_running = None
+
+    # ====================================================================
+    # 6) Ripple overload duration ratio  (1 row, 8 scalar cols)
+    # ====================================================================
+    try:
+        ripple_df = RIPPLE_overload_duration_ratio_trips(pdf)
+
+        ripple_overload_duration_s = float(_get(ripple_df, "overload_duration_s", 0.0) or 0.0)
+        ripple_total_duration_s    = float(_get(ripple_df, "total_duration_s",    0.0) or 0.0)
+        ripple_overload_ratio_pct  = float(_get(ripple_df, "overload_ratio_pct",  0.0) or 0.0)
+        ripple_nb_samples_overload = int(  _get(ripple_df, "nb_samples_overload", 0)   or 0)
+        ripple_nb_samples_total    = int(  _get(ripple_df, "nb_samples_total",    0)   or 0)
+        ripple_sample_rate_hz      = float(_get(ripple_df, "sample_rate_hz",      0.0) or 0.0)
+        ripple_max_abs_torque_nm   = float(_get(ripple_df, "max_abs_torque_nm",   0.0) or 0.0)
+        ripple_max_rpm             = float(_get(ripple_df, "max_rpm",             0.0) or 0.0)
+    except Exception as e:
+        print(f"[main_ice_trips_fn] RIPPLE_overload_duration_ratio_trips failed for {driver_id}/{trip_id}: {e}")
+        ripple_overload_duration_s = 0.0
+        ripple_total_duration_s    = 0.0
+        ripple_overload_ratio_pct  = 0.0
+        ripple_nb_samples_overload = 0
+        ripple_nb_samples_total    = 0
+        ripple_sample_rate_hz      = 0.0
+        ripple_max_abs_torque_nm   = 0.0
+        ripple_max_rpm             = 0.0
+
+
+    out_row = {
+        "DRIVER_ID": driver_id,
+        "TRIP_ID":   trip_id,
+
+        # stops
+        "nbr_arret_mth_demarage_veh_roulant":
+            float(_get(stops_df, "nbr_arret_mth_demarage_veh_roulant", 0.0) or 0.0),
+
+        # starts
+        "nbr_demarrage_mth_veh_roulant":
+            float(_get(starts_df, "nbr_demarrage_mth_veh_roulant", 0.0) or 0.0),
+        "nbr_demarrage_mth_veh_arrete":
+            float(_get(starts_df, "nbr_demarrage_mth_veh_arrete", 0.0) or 0.0),
+
+        # h2d per gear (7 cols)
+        **gear_cols,
+
+        # BS H2D
+        "BS_h2d_matrix_json": bs_h2d_json,
+
+        # H1D engine events (5 cols)
+        "h1d_engine_off_stopped_json":     h1d_off_stopped,
+        "h1d_engine_off_running_json":     h1d_off_running,
+        "h1d_engine_off_transition_json":  h1d_off_transition,
+        "h1d_restart_stopped_json":        h1d_restart_stopped,
+        "h1d_restart_running_json":        h1d_restart_running,
+
+        # Ripple (8 cols)
+        "ripple_overload_duration_s": ripple_overload_duration_s,
+        "ripple_total_duration_s":    ripple_total_duration_s,
+        "ripple_overload_ratio_pct":  ripple_overload_ratio_pct,
+        "ripple_nb_samples_overload": ripple_nb_samples_overload,
+        "ripple_nb_samples_total":    ripple_nb_samples_total,
+        "ripple_sample_rate_hz":      ripple_sample_rate_hz,
+        "ripple_max_abs_torque_nm":   ripple_max_abs_torque_nm,
+        "ripple_max_rpm":             ripple_max_rpm,
+    }
+
+    return pd.DataFrame([out_row])
+
+
+######## main ice trips fn + schema
+from pyspark.sql.types import StructType, StructField, StringType, DoubleType, IntegerType
+
+main_ice_trips_schema = StructType([
+    # ---------- keys ----------
+    StructField("DRIVER_ID", StringType(), True),
+    StructField("TRIP_ID", DoubleType(), True),
+
+    # ---------- ICE stops ----------
+    StructField("nbr_arret_mth_demarage_veh_roulant", DoubleType(), True),
+
+    # ---------- ICE starts ----------
+    StructField("nbr_demarrage_mth_veh_roulant", DoubleType(), True),
+    StructField("nbr_demarrage_mth_veh_arrete", DoubleType(), True),
+
+    # ---------- H2D ICE duration per gear (1 JSON per gear) ----------
+    StructField("h2d_duree_ICE_gear_0_json", StringType(), True),
+    StructField("h2d_duree_ICE_gear_1_json", StringType(), True),
+    StructField("h2d_duree_ICE_gear_2_json", StringType(), True),
+    StructField("h2d_duree_ICE_gear_3_json", StringType(), True),
+    StructField("h2d_duree_ICE_gear_4_json", StringType(), True),
+    StructField("h2d_duree_ICE_gear_5_json", StringType(), True),
+    StructField("h2d_duree_ICE_gear_6_json", StringType(), True),
+
+    # ---------- BS H2D matrix (RPM x Torque, MEL signals) ----------
+    StructField("BS_h2d_matrix_json", StringType(), True),
+
+    # ---------- H1D engine events (5 histograms) ----------
+    StructField("h1d_engine_off_stopped_json",    StringType(), True),
+    StructField("h1d_engine_off_running_json",    StringType(), True),
+    StructField("h1d_engine_off_transition_json", StringType(), True),
+    StructField("h1d_restart_stopped_json",       StringType(), True),
+    StructField("h1d_restart_running_json",       StringType(), True),
+
+    # ---------- Ripple (overload duration ratio) ----------
+    StructField("ripple_overload_duration_s", DoubleType(),  True),
+    StructField("ripple_total_duration_s",    DoubleType(),  True),
+    StructField("ripple_overload_ratio_pct",  DoubleType(),  True),
+    StructField("ripple_nb_samples_overload", IntegerType(), True),
+    StructField("ripple_nb_samples_total",    IntegerType(), True),
+    StructField("ripple_sample_rate_hz",      DoubleType(),  True),
+    StructField("ripple_max_abs_torque_nm",   DoubleType(),  True),
+    StructField("ripple_max_rpm",             DoubleType(),  True),
+])
+
+
+##############################################################################
+############################# DRIVER LEVEL ###################################
+
+
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DoubleType
+
+main_ice_driver_schema = StructType([
+    # ---------- keys ----------
+    StructField("DRIVER_ID", StringType(), True),
+    StructField("month",     IntegerType(), True),
+    StructField("year",      IntegerType(), True),
+    StructField("num_trips", IntegerType(), True),
+
+    # ---------- ICE stops aggregate ----------
+    StructField("nbr_arret_mth_demarage_veh_roulant", DoubleType(), True),
+
+    # ---------- ICE starts aggregate ----------
+    StructField("nbr_demarrage_mth_veh_roulant", DoubleType(), True),
+    StructField("nbr_demarrage_mth_veh_arrete",  DoubleType(), True),
+
+    # ---------- H2D ICE per gear (aggregated, 1 JSON per gear) ----------
+    StructField("H2D_duree_ICE_gear_0_agg", StringType(), True),
+    StructField("H2D_duree_ICE_gear_1_agg", StringType(), True),
+    StructField("H2D_duree_ICE_gear_2_agg", StringType(), True),
+    StructField("H2D_duree_ICE_gear_3_agg", StringType(), True),
+    StructField("H2D_duree_ICE_gear_4_agg", StringType(), True),
+    StructField("H2D_duree_ICE_gear_5_agg", StringType(), True),
+    StructField("H2D_duree_ICE_gear_6_agg", StringType(), True),
+
+    # ---------- BS H2D aggregate ----------
+    StructField("BS_total_duration_H2D_matrix_rpm_torque_BS", StringType(), True),
+
+    # ---------- H1D engine events aggregates (5 JSON cols) ----------
+    StructField("h1d_engine_off_stopped_driver_json",    StringType(), True),
+    StructField("h1d_engine_off_running_driver_json",    StringType(), True),
+    StructField("h1d_engine_off_transition_driver_json", StringType(), True),
+    StructField("h1d_restart_stopped_driver_json",       StringType(), True),
+    StructField("h1d_restart_running_driver_json",       StringType(), True),
+
+    # ---------- Ripple aggregates ----------
+    StructField("ripple_overload_duration_s", DoubleType(),  True),
+    StructField("ripple_total_duration_s",    DoubleType(),  True),
+    StructField("ripple_overload_ratio_pct",  DoubleType(),  True),
+    StructField("ripple_nb_samples_overload", IntegerType(), True),
+    StructField("ripple_nb_samples_total",    IntegerType(), True),
+    StructField("ripple_avg_sample_rate_hz",  DoubleType(),  True),
+    StructField("ripple_max_abs_torque_nm",   DoubleType(),  True),
+    StructField("ripple_max_rpm",             DoubleType(),  True),
+])
+
+import json
+import pandas as pd
+
+def main_ice_driver_fn(pdf: pd.DataFrame) -> pd.DataFrame:
+    """
+    Master driver-level function. Aggregates trip-level metrics
+    (output of main_ice_trips_fn, enriched with month/year)
+    into a single row per (DRIVER_ID, month, year) matching
+    `main_ice_driver_schema`.
+
+    Expected input columns (trip-level, one row per trip):
+        DRIVER_ID, TRIP_ID, month, year,
+        # stops/starts (scalars)
+        nbr_arret_mth_demarage_veh_roulant,
+        nbr_demarrage_mth_veh_roulant, nbr_demarrage_mth_veh_arrete,
+        # ICE H2D per gear (7 JSON cols)
+        h2d_duree_ICE_gear_0_json ... h2d_duree_ICE_gear_6_json,
+        # BS H2D
+        BS_h2d_matrix_json,
+        # H1D engine events
+        h1d_engine_off_stopped_json, h1d_engine_off_running_json,
+        h1d_engine_off_transition_json,
+        h1d_restart_stopped_json, h1d_restart_running_json,
+        # Ripple scalars
+        ripple_overload_duration_s, ripple_total_duration_s,
+        ripple_overload_ratio_pct, ripple_nb_samples_overload,
+        ripple_nb_samples_total, ripple_sample_rate_hz,
+        ripple_max_abs_torque_nm, ripple_max_rpm
+    """
+
+    # ---- Empty input safeguard ----
+    if pdf is None or pdf.empty:
+        empty = {f.name: None for f in main_ice_driver_schema.fields}
+        return pd.DataFrame([empty])
+
+    driver_id = str(pdf["DRIVER_ID"].iloc[0]) if "DRIVER_ID" in pdf.columns else ""
+
+    # month/year (mode is robust if multiple rows differ slightly)
+    month = year = None
+    if "month" in pdf.columns:
+        m_mode = pdf["month"].mode()
+        if len(m_mode) > 0 and pd.notna(m_mode.iloc[0]):
+            month = int(m_mode.iloc[0])
+    if "year" in pdf.columns:
+        y_mode = pdf["year"].mode()
+        if len(y_mode) > 0 and pd.notna(y_mode.iloc[0]):
+            year = int(y_mode.iloc[0])
+
+    num_trips = int(pdf["TRIP_ID"].nunique()) if "TRIP_ID" in pdf.columns else int(len(pdf))
+
+    # Helper to safely get scalar from a (1-row) result df
+    def _get(df, col, default=None):
+        try:
+            if df is None or df.empty or col not in df.columns:
+                return default
+            return df[col].iloc[0]
+        except Exception:
+            return default
+
+    # ====================================================================
+    # 1) ICE stops aggregate
+    # ====================================================================
+    try:
+        stops_df = aggregate_ICE_stops_to_driver_level(pdf)
+        stops_total = float(_get(stops_df, "nbr_arret_mth_demarage_veh_roulant", 0.0) or 0.0)
+    except Exception as e:
+        print(f"[main_ice_driver_fn] aggregate_ICE_stops_to_driver_level failed for {driver_id}: {e}")
+        stops_total = 0.0
+
+    # ====================================================================
+    # 2) ICE starts aggregate
+    # ====================================================================
+    try:
+        starts_df = aggregate_ICE_starts_to_driver_level(pdf)
+        starts_roulant = float(_get(starts_df, "nbr_demarrage_mth_veh_roulant", 0.0) or 0.0)
+        starts_arrete  = float(_get(starts_df, "nbr_demarrage_mth_veh_arrete",  0.0) or 0.0)
+    except Exception as e:
+        print(f"[main_ice_driver_fn] aggregate_ICE_starts_to_driver_level failed for {driver_id}: {e}")
+        starts_roulant = 0.0
+        starts_arrete  = 0.0
+
+    # ====================================================================
+    # 3) H2D ICE per gear aggregates (7 JSON cols → 7 aggregated JSON cols)
+    # ====================================================================
+    gear_aggs = {f"H2D_duree_ICE_gear_{g}_agg": "{}" for g in range(7)}
+    try:
+        for g in range(7):
+            src_col = f"h2d_duree_ICE_gear_{g}_json"
+            if src_col in pdf.columns:
+                json_strings = pdf[src_col].dropna().tolist()
+                if json_strings:
+                    gear_aggs[f"H2D_duree_ICE_gear_{g}_agg"] = (
+                        _aggregate_matrix_jsons_matrix_only(json_strings)
+                    )
+    except Exception as e:
+        print(f"[main_ice_driver_fn] H2D per-gear aggregation failed for {driver_id}: {e}")
+
+    # ====================================================================
+    # 4) BS H2D aggregate
+    #    aggregate_BS_h2d_matrix_to_driver_level expects column 'h2d_matrix_json'
+    # ====================================================================
+    bs_h2d_agg = None
+    try:
+        bs_input = pdf.copy()
+        if "BS_h2d_matrix_json" in bs_input.columns and "h2d_matrix_json" not in bs_input.columns:
+            bs_input = bs_input.rename(columns={"BS_h2d_matrix_json": "h2d_matrix_json"})
+        bs_df = aggregate_BS_h2d_matrix_to_driver_level(bs_input)
+        bs_h2d_agg = _get(bs_df, "BS_total_duration_H2D_matrix_rpm_torque_BS", None)
+    except Exception as e:
+        print(f"[main_ice_driver_fn] aggregate_BS_h2d_matrix_to_driver_level failed for {driver_id}: {e}")
+
+    # ====================================================================
+    # 5) H1D engine events aggregates (5 JSON cols)
+    # ====================================================================
+    h1d_off_stopped = h1d_off_running = h1d_off_transition = None
+    h1d_restart_stopped = h1d_restart_running = None
+    try:
+        h1d_df = aggregate_h1d_engine_events_to_driver_level(pdf)
+        h1d_off_stopped     = _get(h1d_df, "h1d_engine_off_stopped_driver_json",    None)
+        h1d_off_running     = _get(h1d_df, "h1d_engine_off_running_driver_json",    None)
+        h1d_off_transition  = _get(h1d_df, "h1d_engine_off_transition_driver_json", None)
+        h1d_restart_stopped = _get(h1d_df, "h1d_restart_stopped_driver_json",       None)
+        h1d_restart_running = _get(h1d_df, "h1d_restart_running_driver_json",       None)
+    except Exception as e:
+        print(f"[main_ice_driver_fn] aggregate_h1d_engine_events_to_driver_level failed for {driver_id}: {e}")
+
+    # ====================================================================
+    # 6) Ripple aggregate
+    #    RIPPLE_overload_duration_ratio_drivers expects unprefixed columns
+    # ====================================================================
+    ripple = {
+        "ripple_overload_duration_s": 0.0,
+        "ripple_total_duration_s":    0.0,
+        "ripple_overload_ratio_pct":  0.0,
+        "ripple_nb_samples_overload": 0,
+        "ripple_nb_samples_total":    0,
+        "ripple_avg_sample_rate_hz":  0.0,
+        "ripple_max_abs_torque_nm":   0.0,
+        "ripple_max_rpm":             0.0,
+    }
+    try:
+        ripple_input = pdf.rename(columns={
+            "ripple_overload_duration_s": "overload_duration_s",
+            "ripple_total_duration_s":    "total_duration_s",
+            "ripple_overload_ratio_pct":  "overload_ratio_pct",
+            "ripple_nb_samples_overload": "nb_samples_overload",
+            "ripple_nb_samples_total":    "nb_samples_total",
+            "ripple_sample_rate_hz":      "sample_rate_hz",
+            "ripple_max_abs_torque_nm":   "max_abs_torque_nm",
+            "ripple_max_rpm":             "max_rpm",
+        })
+        ripple_df = RIPPLE_overload_duration_ratio_drivers(ripple_input)
+
+        ripple["ripple_overload_duration_s"] = float(_get(ripple_df, "overload_duration_s", 0.0) or 0.0)
+        ripple["ripple_total_duration_s"]    = float(_get(ripple_df, "total_duration_s",    0.0) or 0.0)
+        ripple["ripple_overload_ratio_pct"]  = float(_get(ripple_df, "overload_ratio_pct",  0.0) or 0.0)
+        ripple["ripple_nb_samples_overload"] = int(  _get(ripple_df, "nb_samples_overload", 0)   or 0)
+        ripple["ripple_nb_samples_total"]    = int(  _get(ripple_df, "nb_samples_total",    0)   or 0)
+        ripple["ripple_avg_sample_rate_hz"]  = float(_get(ripple_df, "avg_sample_rate_hz",  0.0) or 0.0)
+        ripple["ripple_max_abs_torque_nm"]   = float(_get(ripple_df, "max_abs_torque_nm",   0.0) or 0.0)
+        ripple["ripple_max_rpm"]             = float(_get(ripple_df, "max_rpm",             0.0) or 0.0)
+    except Exception as e:
+        print(f"[main_ice_driver_fn] RIPPLE_overload_duration_ratio_drivers failed for {driver_id}: {e}")
+
+    out_row = {
+        # keys
+        "DRIVER_ID": driver_id,
+        "month":     month,
+        "year":      year,
+        "num_trips": num_trips,
+
+        # stops
+        "nbr_arret_mth_demarage_veh_roulant": stops_total,
+
+        # starts
+        "nbr_demarrage_mth_veh_roulant": starts_roulant,
+        "nbr_demarrage_mth_veh_arrete":  starts_arrete,
+
+        # h2d per gear (7 cols)
+        **gear_aggs,
+
+        # BS H2D
+        "BS_total_duration_H2D_matrix_rpm_torque_BS": bs_h2d_agg,
+
+        # H1D engine events (5 cols)
+        "h1d_engine_off_stopped_driver_json":    h1d_off_stopped,
+        "h1d_engine_off_running_driver_json":    h1d_off_running,
+        "h1d_engine_off_transition_driver_json": h1d_off_transition,
+        "h1d_restart_stopped_driver_json":       h1d_restart_stopped,
+        "h1d_restart_running_driver_json":       h1d_restart_running,
+
+        # Ripple (8 cols)
+        **ripple,
+    }
+
+    return pd.DataFrame([out_row])
+
+##############################################################################
+
+
+############################# Unit functions trips#############################
 
 ###########H1D ICE TRIPS
 
